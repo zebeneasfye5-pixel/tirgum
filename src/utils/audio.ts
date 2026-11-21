@@ -65,6 +65,89 @@ export async function createInputAudioContext(): Promise<AudioContext> {
   return ctx;
 }
 
+export interface BoostedMicPipeline {
+  ctx: AudioContext;
+  analyser: AnalyserNode;
+  processor: ScriptProcessorNode;
+  setBoost: (enabled: boolean) => void;
+  cleanup: () => void;
+}
+
+/**
+ * Studio voice pre-conditioning chain:
+ * High-pass filter (85Hz) strips room rumble/wind, followed by high-sensitivity
+ * pre-gain + DynamicsCompressor + makeup gain so whispers and distant voices
+ * are lifted clearly without clipping loud speech.
+ */
+export async function createBoostedMicPipeline(
+  stream: MediaStream,
+  boostEnabled: boolean
+): Promise<BoostedMicPipeline> {
+  const ctx = await createInputAudioContext();
+  const source = ctx.createMediaStreamSource(stream);
+
+  const highpass = ctx.createBiquadFilter();
+  highpass.type = "highpass";
+  highpass.frequency.value = 85;
+  highpass.Q.value = 0.7;
+
+  const preGain = ctx.createGain();
+  const compressor = ctx.createDynamicsCompressor();
+  compressor.knee.value = 18;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.14;
+  const makeupGain = ctx.createGain();
+
+  const applyBoost = (enabled: boolean) => {
+    const now = ctx.currentTime;
+    preGain.gain.setTargetAtTime(enabled ? 3.8 : 1.35, now, 0.03);
+    compressor.threshold.setTargetAtTime(enabled ? -38 : -22, now, 0.03);
+    compressor.ratio.setTargetAtTime(enabled ? 8 : 3, now, 0.03);
+    makeupGain.gain.setTargetAtTime(enabled ? 1.65 : 1.05, now, 0.03);
+  };
+  applyBoost(boostEnabled);
+
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 256;
+
+  // 2048-sample frames halve capture latency vs 4096 while keeping WS smooth
+  const processor = ctx.createScriptProcessor(2048, 1, 1);
+  const silentGain = ctx.createGain();
+  silentGain.gain.value = 0;
+
+  source.connect(highpass);
+  highpass.connect(preGain);
+  preGain.connect(compressor);
+  compressor.connect(makeupGain);
+  makeupGain.connect(analyser);
+  analyser.connect(processor);
+  processor.connect(silentGain);
+  silentGain.connect(ctx.destination);
+
+  return {
+    ctx,
+    analyser,
+    processor,
+    setBoost: applyBoost,
+    cleanup: () => {
+      try {
+        processor.disconnect();
+        processor.onaudioprocess = null;
+        analyser.disconnect();
+        makeupGain.disconnect();
+        compressor.disconnect();
+        preGain.disconnect();
+        highpass.disconnect();
+        source.disconnect();
+        silentGain.disconnect();
+      } catch {
+        // ignore cleanup errors
+      }
+      void ctx.close().catch(() => undefined);
+    },
+  };
+}
+
 export class GaplessPcmPlayer {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
@@ -83,7 +166,7 @@ export class GaplessPcmPlayer {
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 256;
       this.gainNode = this.ctx.createGain();
-      this.gainNode.gain.value = this.muted ? 0 : 1;
+      this.gainNode.gain.value = this.muted ? 0 : 1.25;
       this.analyser.connect(this.gainNode);
       this.gainNode.connect(this.ctx.destination);
     }
@@ -100,7 +183,7 @@ export class GaplessPcmPlayer {
   public setMuted(muted: boolean) {
     this.muted = muted;
     if (this.gainNode) {
-      this.gainNode.gain.value = muted ? 0 : 1;
+      this.gainNode.gain.value = muted ? 0 : 1.25;
     }
   }
 
@@ -117,8 +200,8 @@ export class GaplessPcmPlayer {
     source.connect(analyser);
 
     const now = ctx.currentTime;
-    if (this.nextStartTime < now + 0.02) {
-      this.nextStartTime = now + 0.03;
+    if (this.nextStartTime < now + 0.015) {
+      this.nextStartTime = now + 0.025;
     }
 
     source.start(this.nextStartTime);
@@ -146,8 +229,8 @@ export class GaplessPcmPlayer {
       source.connect(analyser);
 
       const now = ctx.currentTime;
-      if (this.nextStartTime < now + 0.02) {
-        this.nextStartTime = now + 0.03;
+      if (this.nextStartTime < now + 0.015) {
+        this.nextStartTime = now + 0.025;
       }
 
       source.start(this.nextStartTime);
@@ -209,4 +292,18 @@ export function playWavBase64(base64Wav: string): Promise<void> {
     audio.onerror = () => resolve();
     void audio.play().catch(() => resolve());
   });
+}
+
+export function speakBrowserFallback(text: string, langCode: string): void {
+  if (typeof window === "undefined" || !("speechSynthesis" in window) || !text.trim()) {
+    return;
+  }
+  try {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = langCode;
+    utter.rate = 1.02;
+    window.speechSynthesis.speak(utter);
+  } catch {
+    // ignore browser speech errors
+  }
 }

@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Ear,
   Globe,
   Loader2,
   Mic,
@@ -25,11 +26,13 @@ import {
 } from "./data/languages";
 import {
   blobToBase64,
-  createInputAudioContext,
+  BoostedMicPipeline,
+  createBoostedMicPipeline,
   downsampleTo16k,
   float32ToPcm16Base64,
   GaplessPcmPlayer,
   playWavBase64,
+  speakBrowserFallback,
 } from "./utils/audio";
 import { WaveformCanvas } from "./components/WaveformCanvas";
 import { LanguagePickerModal } from "./components/LanguagePickerModal";
@@ -85,6 +88,9 @@ export default function App() {
     return (localStorage.getItem("lissan_voice") as VoiceId) || "Zephyr";
   });
   const [autoPlay, setAutoPlay] = useState<boolean>(true);
+  const [whisperBoost, setWhisperBoost] = useState<boolean>(() => {
+    return localStorage.getItem("lissan_whisper_boost") !== "false";
+  });
 
   const [pickerTarget, setPickerTarget] = useState<"source" | "target" | null>(null);
 
@@ -104,6 +110,7 @@ export default function App() {
   // Shared UI state
   const [phraseInput, setPhraseInput] = useState<string>("");
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [noticeBanner, setNoticeBanner] = useState<string | null>(null);
   const [history, setHistory] = useState<TranscriptEntry[]>(() => {
     try {
       const raw = localStorage.getItem("lissan_history");
@@ -122,13 +129,13 @@ export default function App() {
 
   // Refs for WebAudio / WebSocket callbacks (avoid stale closures)
   const liveWsRef = useRef<WebSocket | null>(null);
-  const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const inputStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const micPipelineRef = useRef<BoostedMicPipeline | null>(null);
   const playerRef = useRef<GaplessPcmPlayer | null>(null);
   const liveInputAccRef = useRef<string>("");
   const liveOutputAccRef = useRef<string>("");
   const autoPlayRef = useRef<boolean>(autoPlay);
+  const whisperBoostRef = useRef<boolean>(whisperBoost);
   const sourceLangRef = useRef<string>(sourceLang);
   const targetLangRef = useRef<string>(targetLang);
   const userStoppedLiveRef = useRef<boolean>(true);
@@ -185,6 +192,12 @@ export default function App() {
   }, [autoPlay]);
 
   useEffect(() => {
+    whisperBoostRef.current = whisperBoost;
+    localStorage.setItem("lissan_whisper_boost", String(whisperBoost));
+    micPipelineRef.current?.setBoost(whisperBoost);
+  }, [whisperBoost]);
+
+  useEffect(() => {
     sourceLangRef.current = sourceLang;
   }, [sourceLang]);
 
@@ -194,6 +207,7 @@ export default function App() {
 
   const stopLiveSession = useCallback(() => {
     userStoppedLiveRef.current = true;
+    setNoticeBanner(null);
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
@@ -221,18 +235,13 @@ export default function App() {
       liveOutputAccRef.current = "";
     }
 
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current.onaudioprocess = null;
-      processorRef.current = null;
+    if (micPipelineRef.current) {
+      micPipelineRef.current.cleanup();
+      micPipelineRef.current = null;
     }
     if (inputStreamRef.current) {
       inputStreamRef.current.getTracks().forEach((track) => track.stop());
       inputStreamRef.current = null;
-    }
-    if (inputAudioCtxRef.current) {
-      void inputAudioCtxRef.current.close();
-      inputAudioCtxRef.current = null;
     }
     if (liveWsRef.current) {
       const wsToClose = liveWsRef.current;
@@ -255,7 +264,7 @@ export default function App() {
   }, [stopLiveSession]);
 
   const openLiveSocket = useCallback(
-    (inputCtx: AudioContext, processor: ScriptProcessorNode) => {
+    (pipeline: BoostedMicPipeline) => {
       if (userStoppedLiveRef.current) return;
       if (liveWsRef.current) {
         try {
@@ -278,13 +287,13 @@ export default function App() {
       liveWsRef.current = ws;
 
       ws.onopen = () => {
-        processor.onaudioprocess = (e) => {
+        pipeline.processor.onaudioprocess = (e) => {
           if (ws.readyState !== WebSocket.OPEN || userStoppedLiveRef.current) return;
-          if (inputCtx.state === "suspended") {
-            void inputCtx.resume();
+          if (pipeline.ctx.state === "suspended") {
+            void pipeline.ctx.resume();
           }
           const rawChannel = e.inputBuffer.getChannelData(0);
-          const pcm16k = downsampleTo16k(rawChannel, inputCtx.sampleRate);
+          const pcm16k = downsampleTo16k(rawChannel, pipeline.ctx.sampleRate);
           const base64 = float32ToPcm16Base64(pcm16k);
           ws.send(JSON.stringify({ type: "audio", data: base64 }));
         };
@@ -297,17 +306,26 @@ export default function App() {
             if (msg.connected) {
               setLiveStatus("active");
               setErrorBanner(null);
+              setNoticeBanner(null);
             }
           } else if (msg.type === "inputTranscript" && msg.text) {
+            setNoticeBanner(null);
             liveInputAccRef.current += msg.text;
             setLiveInputText(liveInputAccRef.current);
           } else if (msg.type === "outputTranscript" && msg.text) {
+            setNoticeBanner(null);
             liveOutputAccRef.current += msg.text;
             setLiveOutputText(liveOutputAccRef.current);
           } else if (msg.type === "audio" && msg.data) {
             playerRef.current?.enqueuePcm24kBase64(msg.data);
           } else if (msg.type === "audioWav" && msg.data) {
             void playerRef.current?.enqueueWavBase64(msg.data);
+          } else if (msg.type === "fallbackSpeak" && msg.text) {
+            if (autoPlayRef.current) {
+              speakBrowserFallback(msg.text, msg.lang || targetLangRef.current);
+            }
+          } else if (msg.type === "notice") {
+            setNoticeBanner(t.highTrafficWait);
           } else if (msg.type === "interrupted") {
             playerRef.current?.interrupt();
           } else if (msg.type === "turnComplete") {
@@ -345,18 +363,19 @@ export default function App() {
         if (!userStoppedLiveRef.current && liveWsRef.current === ws) {
           setLiveStatus("connecting");
           reconnectTimerRef.current = setTimeout(() => {
-            if (!userStoppedLiveRef.current && inputAudioCtxRef.current && processorRef.current) {
-              openLiveSocket(inputAudioCtxRef.current, processorRef.current);
+            if (!userStoppedLiveRef.current && micPipelineRef.current) {
+              openLiveSocket(micPipelineRef.current);
             }
           }, 1500);
         }
       };
     },
-    [bidirectional, sourceLang, targetLang, voiceName, stopLiveSession, t.errorGeneric]
+    [bidirectional, sourceLang, targetLang, voiceName, stopLiveSession, t.errorGeneric, t.highTrafficWait]
   );
 
   const startLiveSession = useCallback(async () => {
     setErrorBanner(null);
+    setNoticeBanner(null);
     userStoppedLiveRef.current = false;
     setLiveStatus("connecting");
     setLiveInputText("");
@@ -395,26 +414,15 @@ export default function App() {
       playerRef.current = player;
       setOutputAnalyser(outAnal);
 
-      const inputCtx = await createInputAudioContext();
-      inputAudioCtxRef.current = inputCtx;
+      const pipeline = await createBoostedMicPipeline(stream, whisperBoostRef.current);
+      if (userStoppedLiveRef.current) {
+        pipeline.cleanup();
+        return;
+      }
+      micPipelineRef.current = pipeline;
+      setInputAnalyser(pipeline.analyser);
 
-      const sourceNode = inputCtx.createMediaStreamSource(stream);
-      const inAnal = inputCtx.createAnalyser();
-      inAnal.fftSize = 256;
-      sourceNode.connect(inAnal);
-      setInputAnalyser(inAnal);
-
-      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-
-      // Silent sink so ScriptProcessorNode fires without microphone loopback echo
-      const silentGain = inputCtx.createGain();
-      silentGain.gain.value = 0;
-      sourceNode.connect(processor);
-      processor.connect(silentGain);
-      silentGain.connect(inputCtx.destination);
-
-      openLiveSocket(inputCtx, processor);
+      openLiveSocket(pipeline);
     } catch {
       setErrorBanner(t.errorMicDenied);
       stopLiveSession();
@@ -425,6 +433,7 @@ export default function App() {
     async (payload: { audioBase64?: string; mimeType?: string; text?: string }) => {
       setTurnProcessing(true);
       setErrorBanner(null);
+      setNoticeBanner(null);
       try {
         const res = await fetch("/api/translate-turn", {
           method: "POST",
@@ -439,6 +448,10 @@ export default function App() {
         });
         const data = await res.json();
         if (!res.ok) {
+          if (res.status === 429 || res.status === 503) {
+            setNoticeBanner(t.highTrafficWait);
+            return;
+          }
           throw new Error(data.error || t.errorGeneric);
         }
 
@@ -467,6 +480,8 @@ export default function App() {
 
           if (autoPlay && data.audioWavBase64) {
             void playWavBase64(data.audioWavBase64);
+          } else if (autoPlay && data.translatedText) {
+            speakBrowserFallback(data.translatedText, resolvedTgt);
           }
         }
       } catch (err) {
@@ -475,13 +490,20 @@ export default function App() {
         setTurnProcessing(false);
       }
     },
-    [autoPlay, bidirectional, sourceLang, targetLang, voiceName, t.errorGeneric]
+    [autoPlay, bidirectional, sourceLang, targetLang, voiceName, t.errorGeneric, t.highTrafficWait]
   );
 
   const startTurnRecording = async () => {
     setErrorBanner(null);
+    setNoticeBanner(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       turnStreamRef.current = stream;
 
       const ctx = new AudioContext();
@@ -861,6 +883,20 @@ export default function App() {
 
                   <button
                     type="button"
+                    onClick={() => setWhisperBoost((v) => !v)}
+                    aria-pressed={whisperBoost}
+                    className={`inline-flex h-10 items-center gap-1.5 rounded-lg border px-3.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
+                      whisperBoost
+                        ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+                        : "border-slate-300 bg-white text-slate-800 hover:bg-slate-50"
+                    }`}
+                  >
+                    <Ear className="h-4 w-4" />
+                    <span>{t.whisperBoostLabel}</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => setAutoPlay((v) => !v)}
                     aria-pressed={autoPlay}
                     className={`inline-flex h-10 items-center gap-1.5 rounded-lg border px-3.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
@@ -906,6 +942,15 @@ export default function App() {
                   );
                 })}
               </div>
+
+              {noticeBanner && !errorBanner && (
+                <div
+                  role="status"
+                  className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-base font-bold text-amber-950"
+                >
+                  {noticeBanner}
+                </div>
+              )}
 
               {errorBanner && (
                 <div

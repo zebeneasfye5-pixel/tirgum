@@ -14,15 +14,18 @@ import {
   ShieldCheck,
   Download,
   Share2,
+  Ear,
 } from "lucide-react";
 import { UI_COPY, UiLang } from "../data/i18n";
 import { getLanguageByCode, VOICE_PROFILES, VoiceId } from "../data/languages";
 import {
-  createInputAudioContext,
+  BoostedMicPipeline,
+  createBoostedMicPipeline,
   downsampleTo16k,
   float32ToPcm16Base64,
   GaplessPcmPlayer,
   playWavBase64,
+  speakBrowserFallback,
 } from "../utils/audio";
 import { WaveformCanvas } from "./WaveformCanvas";
 import { LanguagePickerModal } from "./LanguagePickerModal";
@@ -91,6 +94,9 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
   const [callSeconds, setCallSeconds] = useState(0);
   const [micMuted, setMicMuted] = useState(false);
   const [echoGuard, setEchoGuard] = useState(true);
+  const [whisperBoost, setWhisperBoost] = useState<boolean>(() => {
+    return localStorage.getItem("lissan_whisper_boost") !== "false";
+  });
   const [liveCaption, setLiveCaption] = useState<LiveCaption | null>(null);
 
   const [isSendingText, setIsSendingText] = useState(false);
@@ -105,12 +111,12 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
   // Refs for WebSocket & WebAudio callbacks
   const wsRef = useRef<WebSocket | null>(null);
   const playerRef = useRef<GaplessPcmPlayer | null>(null);
-  const inputCtxRef = useRef<AudioContext | null>(null);
   const inputStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const micPipelineRef = useRef<BoostedMicPipeline | null>(null);
   const autoPlayRef = useRef(autoPlay);
   const micMutedRef = useRef(micMuted);
   const echoGuardRef = useRef(echoGuard);
+  const whisperBoostRef = useRef(whisperBoost);
   const liveCallActiveRef = useRef(liveCallActive);
   const lastIncomingAudioAtRef = useRef<number>(0);
   const manualLeaveRef = useRef(false);
@@ -142,6 +148,12 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
   }, [echoGuard]);
 
   useEffect(() => {
+    whisperBoostRef.current = whisperBoost;
+    localStorage.setItem("lissan_whisper_boost", String(whisperBoost));
+    micPipelineRef.current?.setBoost(whisperBoost);
+  }, [whisperBoost]);
+
+  useEffect(() => {
     liveCallActiveRef.current = liveCallActive;
     if (!liveCallActive) {
       setCallSeconds(0);
@@ -164,18 +176,13 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
       void wakeLockRef.current.release().catch(() => undefined);
       wakeLockRef.current = null;
     }
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current.onaudioprocess = null;
-      processorRef.current = null;
+    if (micPipelineRef.current) {
+      micPipelineRef.current.cleanup();
+      micPipelineRef.current = null;
     }
     if (inputStreamRef.current) {
       inputStreamRef.current.getTracks().forEach((tr) => tr.stop());
       inputStreamRef.current = null;
-    }
-    if (inputCtxRef.current) {
-      void inputCtxRef.current.close();
-      inputCtxRef.current = null;
     }
     setInputAnalyser(null);
     setLiveCallActive(false);
@@ -223,32 +230,18 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           .catch(() => undefined);
       }
 
-      const inputCtx = await createInputAudioContext();
-      inputCtxRef.current = inputCtx;
-
-      const sourceNode = inputCtx.createMediaStreamSource(stream);
-      const inAnal = inputCtx.createAnalyser();
-      inAnal.fftSize = 256;
-      sourceNode.connect(inAnal);
-      setInputAnalyser(inAnal);
-
-      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-
-      const silentGain = inputCtx.createGain();
-      silentGain.gain.value = 0;
-      sourceNode.connect(processor);
-      processor.connect(silentGain);
-      silentGain.connect(inputCtx.destination);
+      const pipeline = await createBoostedMicPipeline(stream, whisperBoostRef.current);
+      micPipelineRef.current = pipeline;
+      setInputAnalyser(pipeline.analyser);
 
       wsRef.current.send(JSON.stringify({ type: "room:live_start" }));
       setLiveCallActive(true);
       setMicMuted(false);
 
-      processor.onaudioprocess = (e) => {
+      pipeline.processor.onaudioprocess = (e) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-        if (inputCtx.state === "suspended") {
-          void inputCtx.resume();
+        if (pipeline.ctx.state === "suspended") {
+          void pipeline.ctx.resume();
         }
         if (micMutedRef.current) return;
         if (
@@ -258,7 +251,7 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           return;
         }
         const raw = e.inputBuffer.getChannelData(0);
-        const pcm16k = downsampleTo16k(raw, inputCtx.sampleRate);
+        const pcm16k = downsampleTo16k(raw, pipeline.ctx.sampleRate);
         const base64 = float32ToPcm16Base64(pcm16k);
         wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: base64 }));
       };
@@ -323,6 +316,10 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             lastIncomingAudioAtRef.current = Date.now();
             const player = ensureOutputPlayer();
             void player.enqueueWavBase64(data.data);
+          } else if (data.type === "room:fallback_speak" && data.text) {
+            if (autoPlayRef.current) {
+              speakBrowserFallback(data.text, data.lang || myLangCode);
+            }
           } else if (data.type === "room:live_interrupted") {
             playerRef.current?.interrupt();
           } else if (data.type === "room:message" && data.message) {
@@ -335,6 +332,14 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             });
             if (autoPlayRef.current && incoming.audioWavBase64) {
               void playWavBase64(incoming.audioWavBase64);
+            } else if (
+              autoPlayRef.current &&
+              !incoming.liveStreamed &&
+              !incoming.audioWavBase64 &&
+              incoming.speakerId !== participantId &&
+              incoming.translatedText
+            ) {
+              speakBrowserFallback(incoming.translatedText, incoming.targetLang || myLangCode);
             }
           } else if (data.type === "room:empty_speech") {
             setIsSendingText(false);
@@ -824,6 +829,19 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             )}
 
             <div className="space-y-2.5 pt-2 text-sm font-bold text-slate-800">
+              <label className="flex cursor-pointer items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <Ear className="h-4 w-4 text-emerald-700" />
+                  <span>{t.whisperBoostLabel}</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={whisperBoost}
+                  onChange={(e) => setWhisperBoost(e.target.checked)}
+                  className="h-4 w-4 accent-emerald-700"
+                />
+              </label>
+
               <label className="flex cursor-pointer items-center justify-between">
                 <span className="flex items-center gap-1.5">
                   <ShieldCheck className="h-4 w-4 text-slate-700" />

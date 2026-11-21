@@ -83,6 +83,8 @@ export const UI_COPY = {
     callDurationLabel: 'የጥሪ ቆይታ',
     quickPairsLabel: 'ፈጣን ጥምረቶች',
     shareInvite: 'ሊንክ አጋራ',
+    whisperBoostLabel: 'የርቀትና ሹክሹክታ ማጉያ',
+    highTrafficWait: 'መጠነኛ መጨናነቅ አለ — በሰከንዶች ውስጥ በራሱ ይቀጥላል...',
   },
   en: {
     brand: 'Lissan',
@@ -166,5 +168,7 @@ export const UI_COPY = {
     callDurationLabel: 'Duration',
     quickPairsLabel: 'Quick Pairs',
     shareInvite: 'Share Invite',
+    whisperBoostLabel: 'Whisper & Far-Mic Boost',
+    highTrafficWait: 'High traffic — resuming automatically...',
   },
 } as const;

@@ -31,13 +31,14 @@ function sanitizeLangCode(code?: string, allowAuto = false): string {
   return "en";
 }
 
-function getAiClient(): GoogleGenAI {
+function getAiClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY is not configured on the server.");
   }
   return new GoogleGenAI({
     apiKey,
+    ...(apiVersion ? { apiVersion } : {}),
     httpOptions: {
       headers: {
         "User-Agent": "aistudio-build",
@@ -76,9 +77,17 @@ function isFatalAuthError(msg: string): boolean {
   );
 }
 
-function isTransientOverloadError(err: unknown): boolean {
+function isRetryableQuotaOrLoadError(err: unknown): boolean {
   const msg = extractErrorMessage(err).toUpperCase();
-  return msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("HIGH DEMAND");
+  return (
+    msg.includes("503") ||
+    msg.includes("UNAVAILABLE") ||
+    msg.includes("HIGH DEMAND") ||
+    msg.includes("429") ||
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.includes("RATE_LIMIT") ||
+    msg.includes("QUOTA")
+  );
 }
 
 function formatApiError(err: unknown): { status: number; message: string } {
@@ -92,7 +101,7 @@ function formatApiError(err: unknown): { status: number; message: string } {
   if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
     return {
       status: 429,
-      message: "Rate limit reached. Please wait a moment and try again.",
+      message: "High traffic right now — please wait a second and speak again.",
     };
   }
   if (msg.includes("503") || msg.includes("UNAVAILABLE")) {
@@ -115,8 +124,34 @@ function computePcm16Rms(pcmBuffer: Buffer): number {
   return Math.sqrt(sumSq / sampleCount);
 }
 
+function normalizePcm16Buffer(pcmBuffer: Buffer): Buffer {
+  const sampleCount = Math.floor(pcmBuffer.length / 2);
+  if (sampleCount === 0) return pcmBuffer;
+
+  let peak = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const abs = Math.abs(pcmBuffer.readInt16LE(i * 2));
+    if (abs > peak) peak = abs;
+  }
+
+  // Boost quiet/whispered/far-mic captures up toward 22,000 peak without amplifying pure noise floor
+  if (peak < 55 || peak >= 14000) {
+    return pcmBuffer;
+  }
+
+  const gain = Math.min(12, 22000 / peak);
+  const out = Buffer.allocUnsafe(pcmBuffer.length);
+  for (let i = 0; i < sampleCount; i++) {
+    const boosted = Math.round(pcmBuffer.readInt16LE(i * 2) * gain);
+    const clamped = Math.max(-32768, Math.min(32767, boosted));
+    out.writeInt16LE(clamped, i * 2);
+  }
+  return out;
+}
+
 function pcm16ChunksToWavBase64(chunks: Buffer[], sampleRate = 16000): string {
-  const pcmData = Buffer.concat(chunks);
+  const rawPcm = Buffer.concat(chunks);
+  const pcmData = normalizePcm16Buffer(rawPcm);
   const header = Buffer.alloc(44);
   const byteRate = sampleRate * 2;
   header.write("RIFF", 0);
@@ -165,11 +200,12 @@ async function transcribeAndTranslate(params: {
     : `The speaker is speaking ${sourceLang.name} (${sourceLang.nativeName}). Translate into ${targetLang.name} (${targetLang.nativeName}).`;
 
   const promptText = params.audioBase64
-    ? `Listen carefully to the audio. ${sourceHint}
-1) Transcribe what was said accurately in its original language and native script (e.g., Ge'ez/Ethiopic script for Amharic or Tigrinya, Arabic script for Arabic, Chinese characters for Chinese). If the audio is silent or contains no intelligible speech, return empty strings for all fields.
-2) Translate the meaning naturally and idiomatically into the destination language.
+    ? `Listen closely—even to soft, whispered, or distant speech. ${sourceHint}
+1) Transcribe EVERY single spoken word and syllable verbatim in its original language and native script (e.g., Ge'ez/Ethiopic script for Amharic or Tigrinya, Arabic script for Arabic, Chinese characters for Chinese). Do NOT drop, summarize, or abbreviate any word. Only if there is strictly zero intelligible speech, return empty strings for all fields.
+2) Translate EVERY word completely, accurately, and naturally into the destination language so the listener hears every detail clearly.
 Return strict JSON.`
     : `${sourceHint}
+Translate every word completely and faithfully with zero omissions.
 Text to translate: """${params.text ?? ""}"""
 Return strict JSON with sourceTranscript equal to the original text, detectedLanguage, resolvedSourceLang (BCP-47 code), resolvedTargetLang (BCP-47 code), and translatedText.`;
 
@@ -196,7 +232,7 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
           properties: {
             sourceTranscript: {
               type: Type.STRING,
-              description: "Accurate transcription of the spoken input in its original script.",
+              description: "Exact word-for-word transcription in original script.",
             },
             detectedLanguage: {
               type: Type.STRING,
@@ -212,7 +248,7 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
             },
             translatedText: {
               type: Type.STRING,
-              description: "Natural, faithful translation in the destination language.",
+              description: "Complete, crystal-clear translation preserving every word.",
             },
           },
           required: ["sourceTranscript", "detectedLanguage", "translatedText"],
@@ -225,12 +261,16 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
   try {
     response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
   } catch (err) {
-    if (isTransientOverloadError(err)) {
-      await new Promise((r) => setTimeout(r, 450));
+    if (isRetryableQuotaOrLoadError(err)) {
       try {
-        response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
-      } catch {
         response = await callModel("gemini-3.1-flash-lite", ThinkingLevel.MINIMAL);
+      } catch (err2) {
+        if (isRetryableQuotaOrLoadError(err2)) {
+          await new Promise((r) => setTimeout(r, 600));
+          response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
+        } else {
+          throw err2;
+        }
       }
     } else {
       throw err;
@@ -255,7 +295,7 @@ async function translateTextOnly(params: {
 }): Promise<string> {
   const ai = getAiClient();
   const targetLang = getLanguageByCode(params.targetLangCode);
-  const prompt = `Translate this ${params.sourceLangName} text naturally and directly into ${targetLang.name} (${targetLang.nativeName}). Return ONLY the translated text with no extra commentary or quotation marks.\n\nText: ${params.text}`;
+  const prompt = `Translate this ${params.sourceLangName} text completely and accurately into ${targetLang.name} (${targetLang.nativeName}), preserving every word and detail. Return ONLY the translated text.\n\nText: ${params.text}`;
   let response;
   try {
     response = await ai.models.generateContent({
@@ -266,7 +306,8 @@ async function translateTextOnly(params: {
       },
     });
   } catch (err) {
-    if (isTransientOverloadError(err)) {
+    if (isRetryableQuotaOrLoadError(err)) {
+      await new Promise((r) => setTimeout(r, 300));
       response = await ai.models.generateContent({
         model: "gemini-3.1-flash-lite",
         contents: prompt,
@@ -281,37 +322,148 @@ async function translateTextOnly(params: {
   return (response.text ?? "").trim();
 }
 
+const TTS_STYLE_DIRECTIVE =
+  "Crystal-clear, articulate, unhurried simultaneous interpreter voice; pronounce every single word and letter distinctly.";
+
+function isSchemaFieldError(err: unknown): boolean {
+  const msg = extractErrorMessage(err);
+  return (
+    msg.includes("INVALID_ARGUMENT") ||
+    msg.includes("speechMetadata") ||
+    msg.includes("speechConfig")
+  );
+}
+
 async function synthesizeSpeechWav(text: string, voiceName: string): Promise<string | null> {
   if (!text.trim()) return null;
-  const ai = getAiClient();
+  const ai = getAiClient("v1beta");
   const safeVoice = sanitizeVoice(voiceName);
-  const response = await ai.models.generateContent({
-    model: "gemini-3.8-flash-lite-tts",
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text,
-            speechMetadata: {
-              style: "Clear, warm, natural simultaneous voice interpreter",
-            },
-          },
-        ],
-      },
-    ],
-    config: {
-      responseModalities: ["AUDIO"],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: safeVoice },
+
+  const runTts = (model: string, withSpeechConfig: boolean) =>
+    ai.models.generateContent({
+      model,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            withSpeechConfig
+              ? { text, speechMetadata: { style: TTS_STYLE_DIRECTIVE } }
+              : { text },
+          ],
         },
-      },
-    },
-  });
+      ],
+      config: withSpeechConfig
+        ? {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: safeVoice },
+              },
+            },
+          }
+        : {
+            responseModalities: ["AUDIO"],
+          },
+    });
+
+  const executeWithFallbacks = async (model: string) => {
+    try {
+      return await runTts(model, true);
+    } catch (err) {
+      if (isSchemaFieldError(err)) {
+        return await runTts(model, false);
+      }
+      throw err;
+    }
+  };
+
+  let response;
+  try {
+    response = await executeWithFallbacks("gemini-3.8-flash-lite-tts");
+  } catch (err) {
+    if (isRetryableQuotaOrLoadError(err) || isSchemaFieldError(err)) {
+      response = await executeWithFallbacks("gemini-3.8-flash-tts");
+    } else {
+      throw err;
+    }
+  }
 
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   return base64Audio ?? null;
+}
+
+/**
+ * Streams raw headerless 24kHz PCM16 chunks immediately as Gemini synthesizes them,
+ * eliminating the buffering wait of unary WAV responses.
+ */
+async function synthesizeSpeechStream(
+  text: string,
+  voiceName: string,
+  onPcmChunk: (base64Pcm24k: string) => void
+): Promise<boolean> {
+  if (!text.trim()) return false;
+  const ai = getAiClient("v1beta");
+  const safeVoice = sanitizeVoice(voiceName);
+
+  const streamWithModel = async (model: string, withSpeechConfig: boolean): Promise<boolean> => {
+    let emitted = false;
+    const stream = await ai.models.generateContentStream({
+      model,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            withSpeechConfig
+              ? { text, speechMetadata: { style: TTS_STYLE_DIRECTIVE } }
+              : { text },
+          ],
+        },
+      ],
+      config: withSpeechConfig
+        ? {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: safeVoice },
+              },
+            },
+          }
+        : {
+            responseModalities: ["AUDIO"],
+          },
+    });
+
+    for await (const chunk of stream) {
+      for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
+        const audioData = part.inlineData?.data;
+        if (audioData) {
+          emitted = true;
+          onPcmChunk(audioData);
+        }
+      }
+    }
+    return emitted;
+  };
+
+  const executeStream = async (model: string) => {
+    try {
+      return await streamWithModel(model, true);
+    } catch (err) {
+      if (isSchemaFieldError(err)) {
+        return await streamWithModel(model, false);
+      }
+      throw err;
+    }
+  };
+
+  try {
+    return await executeStream("gemini-3.8-flash-lite-tts");
+  } catch (err) {
+    if (isRetryableQuotaOrLoadError(err) || isSchemaFieldError(err)) {
+      return await executeStream("gemini-3.8-flash-tts");
+    }
+    throw err;
+  }
 }
 
 // ============================================================================
@@ -335,6 +487,7 @@ interface LiveTranslatorChannel {
   vadSpeechActive: boolean;
   vadSpeechStartAt: number;
   vadLastVoiceAt: number;
+  vadNoiseFloor: number;
   vadQueue: Buffer[][];
   vadDraining: boolean;
 }
@@ -423,7 +576,11 @@ async function drainRoomChannelVadQueue(
   channel.vadDraining = true;
   try {
     while (channel.vadQueue.length > 0 && !channel.closed) {
-      const utterance = channel.vadQueue.shift()!;
+      // Coalesce queued speech buffers into a single call to eliminate latency buildup & 429s
+      const utterance: Buffer[] = [];
+      while (channel.vadQueue.length > 0) {
+        utterance.push(...channel.vadQueue.shift()!);
+      }
       const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
       try {
         const result = await transcribeAndTranslate({
@@ -435,9 +592,6 @@ async function drainRoomChannelVadQueue(
         if (channel.closed || !result.sourceTranscript || !result.translatedText) {
           continue;
         }
-        const wavOut = await synthesizeSpeechWav(result.translatedText, speaker.voiceName).catch(
-          () => null
-        );
         const msgId = `live_${speaker.id}_${Date.now()}_${channel.targetLangCode}`;
         const ts = Date.now();
         room.messages.push({
@@ -454,18 +608,9 @@ async function drainRoomChannelVadQueue(
         });
         if (room.messages.length > 100) room.messages.shift();
 
+        // Broadcast transcript message immediately before TTS finishes
         for (const p of room.participants.values()) {
           if (p.ws.readyState !== WebSocket.OPEN) continue;
-          if (p.id !== speaker.id && p.langCode === channel.targetLangCode && wavOut) {
-            p.ws.send(
-              JSON.stringify({
-                type: "room:live_audio_wav",
-                speakerId: speaker.id,
-                targetLang: channel.targetLangCode,
-                data: wavOut,
-              })
-            );
-          }
           if (p.id === speaker.id || p.langCode === channel.targetLangCode) {
             p.ws.send(
               JSON.stringify({
@@ -489,6 +634,48 @@ async function drainRoomChannelVadQueue(
             );
           }
         }
+
+        // Stream 24kHz PCM chunks live to listeners
+        const streamed = await synthesizeSpeechStream(
+          result.translatedText,
+          speaker.voiceName,
+          (pcmBase64) => {
+            if (channel.closed) return;
+            const audioPayload = JSON.stringify({
+              type: "room:live_audio_out",
+              speakerId: speaker.id,
+              targetLang: channel.targetLangCode,
+              data: pcmBase64,
+            });
+            for (const p of room.participants.values()) {
+              if (
+                p.id !== speaker.id &&
+                p.langCode === channel.targetLangCode &&
+                p.ws.readyState === WebSocket.OPEN
+              ) {
+                p.ws.send(audioPayload);
+              }
+            }
+          }
+        ).catch(() => false);
+
+        if (!streamed && !channel.closed) {
+          const fallbackPayload = JSON.stringify({
+            type: "room:fallback_speak",
+            speakerId: speaker.id,
+            text: result.translatedText,
+            lang: channel.targetLangCode,
+          });
+          for (const p of room.participants.values()) {
+            if (
+              p.id !== speaker.id &&
+              p.langCode === channel.targetLangCode &&
+              p.ws.readyState === WebSocket.OPEN
+            ) {
+              p.ws.send(fallbackPayload);
+            }
+          }
+        }
       } catch {
         // Keep continuous stream alive across individual turn glitches
       }
@@ -508,14 +695,17 @@ function feedRoomChannelVadFrame(
   if (pcmBuf.length < 4) return;
   const rms = computePcm16Rms(pcmBuf);
   const now = Date.now();
-  const SPEECH_THRESHOLD = 0.014;
-  const SILENCE_HANG_MS = 750;
-  const MAX_UTTERANCE_MS = 10000;
-  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.4; // 400ms
+  const SPEECH_THRESHOLD = Math.max(0.0038, channel.vadNoiseFloor * 2.15);
+  const SILENCE_HANG_MS = 380;
+  const MAX_UTTERANCE_MS = 5500;
+  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms catches short words cleanly
 
   if (!channel.vadSpeechActive) {
+    if (rms < SPEECH_THRESHOLD) {
+      channel.vadNoiseFloor = channel.vadNoiseFloor * 0.92 + rms * 0.08;
+    }
     channel.vadPreRoll.push(pcmBuf);
-    if (channel.vadPreRoll.length > 2) channel.vadPreRoll.shift();
+    if (channel.vadPreRoll.length > 3) channel.vadPreRoll.shift();
     if (rms >= SPEECH_THRESHOLD) {
       channel.vadSpeechActive = true;
       channel.vadSpeechStartAt = now;
@@ -561,7 +751,7 @@ async function openRoomTranslatorChannel(
     useTranslateModel: boolean,
     withCompression: boolean
   ): Promise<LiveSessionHandle> => {
-    const ai = getAiClient();
+    const ai = getAiClient("v1beta");
     const model = useTranslateModel ? "gemini-3.5-live-translate-preview" : "gemini-3.8-live";
     const gen = ++channel.generation;
 
@@ -582,7 +772,7 @@ async function openRoomTranslatorChannel(
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          systemInstruction: `You are a simultaneous voice interpreter on a live phone call. Listen to ${speaker.name} speaking ${sourceLang.name} (${sourceLang.nativeName}) and immediately speak ONLY the natural, accurate translation in ${targetLang.name} (${targetLang.nativeName}). Never reply to the speaker or add commentary.`,
+          systemInstruction: `You are an ultra-fast, high-precision simultaneous voice interpreter on a live phone call. Listen carefully even to soft, whispered, or distant speech from ${speaker.name} in ${sourceLang.name} (${sourceLang.nativeName}), and immediately speak ONLY the complete, word-for-word accurate translation in ${targetLang.name} (${targetLang.nativeName}), pronouncing every single word clearly without skipping or summarizing.`,
         };
 
     const config = withCompression
@@ -846,6 +1036,7 @@ function reconcileParticipantTranslators(room: RoomState, speaker: RoomParticipa
         vadSpeechActive: false,
         vadSpeechStartAt: 0,
         vadLastVoiceAt: 0,
+        vadNoiseFloor: 0.0025,
         vadQueue: [],
         vadDraining: false,
       };
@@ -931,6 +1122,7 @@ async function startServer() {
         resolvedSourceLang: translated.resolvedSourceLang,
         resolvedTargetLang: translated.resolvedTargetLang,
         audioWavBase64,
+        fallbackTts: !audioWavBase64,
         ttsWarning,
       });
     } catch (err) {
@@ -1015,6 +1207,7 @@ async function startServer() {
     let vadSpeechActive = false;
     let vadSpeechStartAt = 0;
     let vadLastVoiceAt = 0;
+    let vadNoiseFloor = 0.0025;
     const vadQueue: Buffer[][] = [];
     let vadDraining = false;
 
@@ -1036,7 +1229,11 @@ async function startServer() {
       vadDraining = true;
       try {
         while (vadQueue.length > 0 && !isClosed && clientWs.readyState === WebSocket.OPEN) {
-          const utterance = vadQueue.shift()!;
+          // Merge any stacked speech buffers into one turn to slash latency and RPM consumption
+          const utterance: Buffer[] = [];
+          while (vadQueue.length > 0) {
+            utterance.push(...vadQueue.shift()!);
+          }
           const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
           try {
             const result = await transcribeAndTranslate({
@@ -1058,11 +1255,24 @@ async function startServer() {
               clientWs.send(
                 JSON.stringify({ type: "outputTranscript", text: result.translatedText })
               );
-              const wavOut = await synthesizeSpeechWav(result.translatedText, voiceName).catch(
-                () => null
-              );
-              if (wavOut && !isClosed && clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(JSON.stringify({ type: "audioWav", data: wavOut }));
+              const streamed = await synthesizeSpeechStream(
+                result.translatedText,
+                voiceName,
+                (pcmBase64) => {
+                  if (!isClosed && clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({ type: "audio", data: pcmBase64 }));
+                  }
+                }
+              ).catch(() => false);
+
+              if (!streamed && !isClosed && clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(
+                  JSON.stringify({
+                    type: "fallbackSpeak",
+                    text: result.translatedText,
+                    lang: result.resolvedTargetLang || targetLang.code,
+                  })
+                );
               }
             }
             if (!isClosed && clientWs.readyState === WebSocket.OPEN) {
@@ -1074,6 +1284,20 @@ async function startServer() {
               clientWs.send(JSON.stringify({ type: "error", message: formatted.message }));
               clientWs.close();
               return;
+            }
+            if (
+              (formatted.status === 429 || formatted.status === 503) &&
+              clientWs.readyState === WebSocket.OPEN
+            ) {
+              clientWs.send(
+                JSON.stringify({
+                  type: "notice",
+                  level: "traffic",
+                  message: formatted.message,
+                })
+              );
+              // Brief pause before next loop so bursty RPM resets cleanly without dropping mic
+              await new Promise((r) => setTimeout(r, 900));
             }
           }
         }
@@ -1087,14 +1311,17 @@ async function startServer() {
       if (pcmBuf.length < 4) return;
       const rms = computePcm16Rms(pcmBuf);
       const now = Date.now();
-      const SPEECH_THRESHOLD = 0.014;
-      const SILENCE_HANG_MS = 750;
-      const MAX_UTTERANCE_MS = 10000;
-      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.4; // 400ms
+      const SPEECH_THRESHOLD = Math.max(0.0038, vadNoiseFloor * 2.15);
+      const SILENCE_HANG_MS = 380;
+      const MAX_UTTERANCE_MS = 5500;
+      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms
 
       if (!vadSpeechActive) {
+        if (rms < SPEECH_THRESHOLD) {
+          vadNoiseFloor = vadNoiseFloor * 0.92 + rms * 0.08;
+        }
         vadPreRoll.push(pcmBuf);
-        if (vadPreRoll.length > 2) vadPreRoll.shift();
+        if (vadPreRoll.length > 3) vadPreRoll.shift();
         if (rms >= SPEECH_THRESHOLD) {
           vadSpeechActive = true;
           vadSpeechStartAt = now;
@@ -1125,7 +1352,7 @@ async function startServer() {
     };
 
     const activateContinuousVadFallback = () => {
-      if (isClosed) return;
+      if (isClosed || mode === "vad_stream") return;
       mode = "vad_stream";
       try {
         activeSession?.close();
@@ -1170,14 +1397,14 @@ async function startServer() {
       useTranslateModel: boolean,
       withCompression: boolean
     ): Promise<LiveSessionHandle> => {
-      const ai = getAiClient();
+      const ai = getAiClient("v1beta");
       const model = useTranslateModel ? "gemini-3.5-live-translate-preview" : "gemini-3.8-live";
       const gen = ++sessionGeneration;
 
       const systemInstruction =
         isBidirectional && sourceLang
-          ? `You are a seamless two-way simultaneous voice interpreter between ${sourceLang.name} (${sourceLang.nativeName}) and ${targetLang.name} (${targetLang.nativeName}). Listen to each spoken phrase: if it is in ${sourceLang.name}, immediately speak ONLY the natural translation in ${targetLang.name}. If it is in ${targetLang.name}, immediately speak ONLY the natural translation in ${sourceLang.name}. Never reply to the content or add commentary.`
-          : `You are a simultaneous voice interpreter. Listen to the speaker (${sourceLangLabel}) and immediately translate everything they say aloud into ${targetLang.name} (${targetLang.nativeName}). Speak ONLY the direct translation naturally—do not answer questions, do not explain, and do not add commentary.`;
+          ? `You are an ultra-fast, high-precision two-way simultaneous voice interpreter between ${sourceLang.name} (${sourceLang.nativeName}) and ${targetLang.name} (${targetLang.nativeName}). Listen carefully even to soft, whispered, or distant speech: if it is ${sourceLang.name}, immediately speak ONLY the complete, word-for-word accurate translation in ${targetLang.name}; if it is ${targetLang.name}, immediately speak ONLY the complete translation in ${sourceLang.name}. Pronounce every word clearly with zero omissions or commentary.`
+          : `You are an ultra-fast, high-precision simultaneous voice interpreter. Listen carefully even to soft, whispered, or distant speech (${sourceLangLabel}) and immediately speak ONLY the complete, word-for-word accurate translation in ${targetLang.name} (${targetLang.nativeName}), pronouncing every word clearly with zero omissions or commentary.`;
 
       const baseConfig = useTranslateModel
         ? {
