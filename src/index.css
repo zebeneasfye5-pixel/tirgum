@@ -9,11 +9,15 @@
 
   html {
     font-family: var(--font-sans);
+    font-weight: 500;
+    color: #020617;
     scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
   }
 
   h1, h2, h3, h4, .font-display {
     font-family: var(--font-display);
+    font-weight: 700;
   }
 
   .font-mono {

@@ -49,16 +49,16 @@ export function LanguagePickerModal({
       aria-modal="true"
       aria-label={t.selectLanguageTitle}
     >
-      <div className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+      <div className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-slate-300 bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
-          <h2 className="font-display text-lg font-semibold text-slate-900">
+          <h2 className="font-display text-xl font-extrabold text-slate-950">
             {t.selectLanguageTitle}
           </h2>
           <button
             type="button"
             onClick={onClose}
             aria-label={t.close}
-            className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
+            className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-700 transition-colors hover:bg-slate-100 hover:text-slate-950 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
           >
             <X className="h-5 w-5" />
           </button>
@@ -66,14 +66,14 @@ export function LanguagePickerModal({
 
         <div className="space-y-3 border-b border-slate-200 px-6 py-4">
           <div className="relative">
-            <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
             <input
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t.searchLanguage}
               autoFocus
-              className="h-11 w-full rounded-lg border border-slate-200 bg-slate-50 pl-10 pr-4 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:bg-white focus:outline-none"
+              className="h-11 w-full rounded-lg border border-slate-300 bg-slate-50 pl-10 pr-4 text-base font-semibold text-slate-950 placeholder:text-slate-500 focus:border-blue-600 focus:bg-white focus:outline-none"
             />
           </div>
 
@@ -83,10 +83,10 @@ export function LanguagePickerModal({
                 key={r}
                 type="button"
                 onClick={() => setRegion(r)}
-                className={`whitespace-nowrap shrink-0 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                className={`whitespace-nowrap shrink-0 rounded-md px-3.5 py-2 text-sm font-bold transition-colors ${
                   region === r
                     ? "bg-slate-900 text-white"
-                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900"
+                    : "bg-slate-100 text-slate-800 hover:bg-slate-200 hover:text-slate-950"
                 }`}
               >
                 {r === "All" ? t.allRegions : r}
@@ -105,23 +105,23 @@ export function LanguagePickerModal({
               }}
               className={`mb-3 flex w-full items-center justify-between rounded-lg border px-4 py-3 text-left transition-colors ${
                 selectedCode === "auto"
-                  ? "border-blue-600 bg-blue-50/70 text-blue-900"
-                  : "border-slate-200 bg-white text-slate-800 hover:border-slate-300 hover:bg-slate-50"
+                  ? "border-blue-600 bg-blue-50 text-blue-950"
+                  : "border-slate-300 bg-white text-slate-950 hover:border-slate-400 hover:bg-slate-50"
               }`}
             >
               <div>
-                <div className="text-sm font-semibold">{t.autoDetect}</div>
-                <div className="text-xs text-slate-500">
+                <div className="text-base font-extrabold">{t.autoDetect}</div>
+                <div className="text-sm font-semibold text-slate-700">
                   {uiLang === "am"
                     ? "የተናጋሪውን ቋንቋ በራሱ ይለያል"
                     : "Automatically identifies the spoken language"}
                 </div>
               </div>
-              {selectedCode === "auto" && <Check className="h-4 w-4 text-blue-700" />}
+              {selectedCode === "auto" && <Check className="h-5 w-5 text-blue-700" />}
             </button>
           )}
 
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
             {filtered.map((lang: LanguageOption) => {
               const isSelected = lang.code === selectedCode;
               return (
@@ -132,22 +132,22 @@ export function LanguagePickerModal({
                     onSelect(lang.code);
                     onClose();
                   }}
-                  className={`flex items-center justify-between rounded-lg border px-3.5 py-2.5 text-left transition-colors ${
+                  className={`flex items-center justify-between rounded-lg border px-4 py-3 text-left transition-colors ${
                     isSelected
-                      ? "border-blue-600 bg-blue-50/70"
-                      : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50"
+                      ? "border-blue-600 bg-blue-50"
+                      : "border-slate-300 bg-white hover:border-slate-400 hover:bg-slate-50"
                   }`}
                 >
                   <div className="min-w-0 pr-2">
-                    <div className="truncate text-sm font-semibold text-slate-900">
+                    <div className="truncate text-base font-extrabold text-slate-950">
                       {lang.nativeName}
                     </div>
-                    <div className="truncate text-xs text-slate-500">
+                    <div className="truncate text-sm font-semibold text-slate-700">
                       {uiLang === "am" ? `${lang.amharicName} · ${lang.name}` : lang.name}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
-                    <span className="font-mono text-[11px] uppercase text-slate-400">
+                    <span className="font-mono text-xs font-bold uppercase text-slate-600">
                       {lang.code}
                     </span>
                     {isSelected && <Check className="h-4 w-4 text-blue-700" />}

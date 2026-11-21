@@ -18,6 +18,7 @@ import {
 import { UI_COPY, UiLang } from "../data/i18n";
 import { getLanguageByCode, VOICE_PROFILES, VoiceId } from "../data/languages";
 import {
+  createInputAudioContext,
   downsampleTo16k,
   float32ToPcm16Base64,
   GaplessPcmPlayer,
@@ -156,7 +157,13 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
     activeRoomRef.current = activeRoomCode;
   }, [activeRoomCode]);
 
+  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
+
   const stopLiveCall = useCallback(() => {
+    if (wakeLockRef.current) {
+      void wakeLockRef.current.release().catch(() => undefined);
+      wakeLockRef.current = null;
+    }
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current.onaudioprocess = null;
@@ -205,10 +212,18 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
       });
       inputStreamRef.current = stream;
 
-      const inputCtx = new AudioContext({ sampleRate: 16000 });
-      if (inputCtx.state === "suspended") {
-        await inputCtx.resume();
+      if ("wakeLock" in navigator) {
+        void (navigator as Navigator & {
+          wakeLock?: { request: (type: string) => Promise<{ release: () => Promise<void> }> };
+        }).wakeLock
+          ?.request("screen")
+          .then((lock) => {
+            wakeLockRef.current = lock;
+          })
+          .catch(() => undefined);
       }
+
+      const inputCtx = await createInputAudioContext();
       inputCtxRef.current = inputCtx;
 
       const sourceNode = inputCtx.createMediaStreamSource(stream);
@@ -232,6 +247,9 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
 
       processor.onaudioprocess = (e) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        if (inputCtx.state === "suspended") {
+          void inputCtx.resume();
+        }
         if (micMutedRef.current) return;
         if (
           echoGuardRef.current &&
@@ -301,6 +319,10 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             lastIncomingAudioAtRef.current = Date.now();
             const player = ensureOutputPlayer();
             player.enqueuePcm24kBase64(data.data);
+          } else if (data.type === "room:live_audio_wav" && data.data) {
+            lastIncomingAudioAtRef.current = Date.now();
+            const player = ensureOutputPlayer();
+            void player.enqueueWavBase64(data.data);
           } else if (data.type === "room:live_interrupted") {
             playerRef.current?.interrupt();
           } else if (data.type === "room:message" && data.message) {
@@ -508,45 +530,45 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
 
   if (!activeRoomCode) {
     return (
-      <div className="mx-auto max-w-4xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
+      <div className="mx-auto max-w-4xl rounded-xl border border-slate-300 bg-white p-6 sm:p-8">
         <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
           <div className="space-y-4">
-            <h2 className="font-display text-xl font-semibold text-slate-900">
+            <h2 className="font-display text-2xl font-extrabold text-slate-950">
               {t.roomCreateTitle}
             </h2>
-            <p className="text-sm leading-relaxed text-slate-600">
+            <p className="text-base font-semibold leading-relaxed text-slate-700">
               {t.roomSpeakHint}
             </p>
             <div className="space-y-3 pt-2">
-              <label className="block text-xs font-medium text-slate-600">
+              <label className="block text-sm font-bold text-slate-800">
                 {t.yourName}
                 <input
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  className="mt-1.5 h-11 w-full rounded-lg border border-slate-200 bg-slate-50 px-3.5 text-sm text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none"
+                  className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-slate-50 px-3.5 text-base font-bold text-slate-950 focus:border-blue-600 focus:bg-white focus:outline-none"
                 />
               </label>
               <div>
-                <span className="block text-xs font-medium text-slate-600">
+                <span className="block text-sm font-bold text-slate-800">
                   {t.yourLang}
                 </span>
                 <button
                   type="button"
                   onClick={() => setPickerOpen(true)}
-                  className="mt-1.5 flex h-11 w-full items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3.5 text-left text-sm font-medium text-slate-900 transition-colors hover:border-slate-300 hover:bg-white"
+                  className="mt-1.5 flex h-11 w-full items-center justify-between rounded-lg border border-slate-300 bg-slate-50 px-3.5 text-left text-base font-bold text-slate-950 transition-colors hover:border-slate-400 hover:bg-white"
                 >
                   <span className="truncate">
                     {myLang.nativeName} · {uiLang === "am" ? myLang.amharicName : myLang.name}
                   </span>
-                  <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
+                  <ChevronDown className="h-4 w-4 shrink-0 text-slate-600" />
                 </button>
               </div>
             </div>
             <button
               type="button"
               onClick={handleCreateRoom}
-              className="mt-2 inline-flex h-11 w-full items-center justify-center rounded-lg bg-blue-700 px-5 text-sm font-semibold text-white transition-colors hover:bg-blue-800 whitespace-nowrap"
+              className="mt-2 inline-flex h-12 w-full items-center justify-center rounded-lg bg-blue-700 px-5 text-base font-extrabold text-white transition-colors hover:bg-blue-800 whitespace-nowrap"
             >
               {t.createRoomBtn}
             </button>
@@ -557,15 +579,15 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             className="flex flex-col justify-between space-y-4 border-t border-slate-200 pt-6 md:border-l md:border-t-0 md:pl-8 md:pt-0"
           >
             <div className="space-y-4">
-              <h2 className="font-display text-xl font-semibold text-slate-900">
+              <h2 className="font-display text-2xl font-extrabold text-slate-950">
                 {t.roomJoinTitle}
               </h2>
-              <p className="text-sm leading-relaxed text-slate-600">
+              <p className="text-base font-semibold leading-relaxed text-slate-700">
                 {uiLang === "am"
                   ? "ከሌላ ሰው የተላከልዎትን ባለ 6 ፊደል የክፍል ኮድ ያስገቡ (ወይም የግብዣ ሊንኩን ይክፈቱ)።"
                   : "Enter the 6-character room code shared by the other speaker, then start the hands-free live call."}
               </p>
-              <label className="block text-xs font-medium text-slate-600">
+              <label className="block text-sm font-bold text-slate-800">
                 {t.roomCodePlaceholder}
                 <input
                   type="text"
@@ -573,14 +595,14 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                   onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
                   placeholder="AB12CD"
                   maxLength={10}
-                  className="mt-1.5 h-11 w-full rounded-lg border border-slate-200 bg-slate-50 px-3.5 font-mono text-base uppercase tracking-wider text-slate-900 focus:border-blue-600 focus:bg-white focus:outline-none"
+                  className="mt-1.5 h-11 w-full rounded-lg border border-slate-300 bg-slate-50 px-3.5 font-mono text-lg font-bold uppercase tracking-wider text-slate-950 focus:border-blue-600 focus:bg-white focus:outline-none"
                 />
               </label>
             </div>
             <button
               type="submit"
               disabled={!joinCodeInput.trim()}
-              className="inline-flex h-11 w-full items-center justify-center rounded-lg border border-slate-300 bg-white px-5 text-sm font-semibold text-slate-900 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
+              className="inline-flex h-12 w-full items-center justify-center rounded-lg border border-slate-300 bg-white px-5 text-base font-extrabold text-slate-950 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
             >
               {t.joinRoomBtn}
             </button>
@@ -588,7 +610,7 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
         </div>
 
         {errorMsg && (
-          <div className="mt-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <div className="mt-5 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-base font-bold text-red-900">
             {errorMsg}
           </div>
         )}
@@ -607,22 +629,22 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
   return (
     <div className="mx-auto max-w-5xl space-y-5">
       {/* Room Control Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-5 py-4">
+      <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-300 bg-white px-5 py-4">
         <div className="flex flex-wrap items-center gap-4">
           <div>
-            <div className="text-xs text-slate-500">
+            <div className="text-xs font-bold text-slate-700">
               {uiLang === "am" ? "የክፍል ኮድ" : "Room Code"}
             </div>
-            <div className="font-mono text-lg font-semibold tracking-wider text-slate-900">
+            <div className="font-mono text-xl font-extrabold tracking-wider text-slate-950">
               {activeRoomCode}
             </div>
           </div>
 
-          <div className="h-8 w-px bg-slate-200" aria-hidden="true" />
+          <div className="h-8 w-px bg-slate-300" aria-hidden="true" />
 
-          <div className="flex items-center gap-2 text-xs font-medium text-slate-700">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-800">
             <span
-              className={`h-2 w-2 rounded-full ${
+              className={`h-2.5 w-2.5 rounded-full ${
                 liveCallActive
                   ? "bg-emerald-600"
                   : wsConnected
@@ -639,7 +661,7 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                 : t.connectingLive}
             </span>
             {liveCallActive && (
-              <span className="font-mono text-xs font-semibold text-emerald-700 tabular-nums">
+              <span className="font-mono text-sm font-extrabold text-emerald-800 tabular-nums">
                 · {formatDuration(callSeconds)}
               </span>
             )}
@@ -650,17 +672,17 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           <button
             type="button"
             onClick={() => setPickerOpen(true)}
-            className="inline-flex h-10 items-center gap-2 rounded-lg border border-blue-200 bg-blue-50/70 px-3.5 text-xs font-semibold text-blue-900 transition-colors hover:bg-blue-50 whitespace-nowrap shrink-0"
+            className="inline-flex h-10 items-center gap-2 rounded-lg border border-blue-300 bg-blue-50 px-3.5 text-sm font-bold text-blue-950 transition-colors hover:bg-blue-100 whitespace-nowrap shrink-0"
           >
             <span>{myLang.nativeName}</span>
-            <ChevronDown className="h-3.5 w-3.5 text-blue-700" />
+            <ChevronDown className="h-4 w-4 text-blue-800" />
           </button>
 
           <select
             aria-label={t.voiceLabel}
             value={myVoice}
             onChange={(e) => handleVoiceChange(e.target.value as VoiceId)}
-            className="h-10 rounded-lg border border-slate-200 bg-slate-50 px-3 text-xs font-medium text-slate-800 focus:border-blue-600 focus:outline-none"
+            className="h-10 rounded-lg border border-slate-300 bg-slate-50 px-3 text-sm font-bold text-slate-950 focus:border-blue-600 focus:outline-none"
           >
             {VOICE_PROFILES.map((v) => (
               <option key={v.id} value={v.id}>
@@ -672,12 +694,12 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           <button
             type="button"
             onClick={copyInvite}
-            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
+            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
           >
             {copiedLink ? (
-              <Check className="h-3.5 w-3.5 text-emerald-700" />
+              <Check className="h-4 w-4 text-emerald-700" />
             ) : (
-              <Copy className="h-3.5 w-3.5" />
+              <Copy className="h-4 w-4" />
             )}
             <span>{copiedLink ? t.copied : t.copyInviteLink}</span>
           </button>
@@ -685,9 +707,9 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           <button
             type="button"
             onClick={shareInvite}
-            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
+            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
           >
-            <Share2 className="h-3.5 w-3.5" />
+            <Share2 className="h-4 w-4" />
             <span>{t.shareInvite}</span>
           </button>
 
@@ -695,9 +717,9 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             <button
               type="button"
               onClick={exportRoomTranscript}
-              className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
+              className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap shrink-0"
             >
-              <Download className="h-3.5 w-3.5" />
+              <Download className="h-4 w-4" />
               <span>{t.exportTranscript}</span>
             </button>
           )}
@@ -705,9 +727,9 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           <button
             type="button"
             onClick={handleLeaveRoom}
-            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-semibold text-red-700 transition-colors hover:bg-red-50 whitespace-nowrap shrink-0"
+            className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-red-700 transition-colors hover:bg-red-50 whitespace-nowrap shrink-0"
           >
-            <LogOut className="h-3.5 w-3.5" />
+            <LogOut className="h-4 w-4" />
             <span>{t.leaveRoom}</span>
           </button>
         </div>
@@ -715,37 +737,37 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
 
       {/* Main Split: Call Controls + Participants & Live Feed */}
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-        <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-5 lg:col-span-4">
-          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-            <h3 className="flex items-center gap-2 font-display text-sm font-semibold text-slate-900">
-              <Users className="h-4 w-4 text-slate-500" />
+        <div className="space-y-4 rounded-xl border border-slate-300 bg-white p-5 lg:col-span-4">
+          <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+            <h3 className="flex items-center gap-2 font-display text-base font-extrabold text-slate-950">
+              <Users className="h-4 w-4 text-slate-700" />
               <span>{t.participantsTitle}</span>
             </h3>
-            <span className="font-mono text-xs text-slate-500 tabular-nums">
+            <span className="font-mono text-sm font-bold text-slate-800 tabular-nums">
               {participants.length}
             </span>
           </div>
 
-          <div className="divide-y divide-slate-100">
+          <div className="divide-y divide-slate-200">
             {participants.map((p) => {
               const pLang = getLanguageByCode(p.langCode);
               const isMe = p.id === participantId;
               return (
-                <div key={p.id} className="flex items-center justify-between py-2.5 text-sm">
+                <div key={p.id} className="flex items-center justify-between py-3 text-base">
                   <div className="min-w-0">
-                    <div className="truncate font-medium text-slate-900">
+                    <div className="truncate font-bold text-slate-950">
                       {p.name}
                       {isMe && (
-                        <span className="ml-1.5 text-xs font-normal text-blue-700">
+                        <span className="ml-1.5 text-sm font-bold text-blue-700">
                           ({t.youTag})
                         </span>
                       )}
                     </div>
-                    <div className="truncate text-xs text-slate-500">
+                    <div className="truncate text-sm font-semibold text-slate-700">
                       {pLang.nativeName} · {uiLang === "am" ? pLang.amharicName : pLang.name}
                     </div>
                   </div>
-                  <span className="text-xs font-medium text-slate-500 shrink-0">
+                  <span className="text-sm font-bold text-slate-800 shrink-0">
                     {p.liveCallActive
                       ? uiLang === "am"
                         ? "በጥሪ ላይ"
@@ -758,53 +780,53 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
               );
             })}
             {participants.length < 2 && (
-              <p className="pt-3 text-xs leading-relaxed text-slate-500">
+              <p className="pt-3 text-sm font-semibold leading-relaxed text-slate-700">
                 {t.noParticipantsYet}
               </p>
             )}
           </div>
 
           {/* Hands-Free Live Call Primary Controls */}
-          <div className="space-y-2.5 border-t border-slate-100 pt-4">
+          <div className="space-y-3 border-t border-slate-200 pt-4">
             {!liveCallActive ? (
               <button
                 type="button"
                 onClick={startLiveCall}
                 disabled={!wsConnected}
-                className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-emerald-700 px-4 text-sm font-semibold text-white transition-colors hover:bg-emerald-800 disabled:opacity-50"
+                className="inline-flex h-14 w-full items-center justify-center gap-2 rounded-lg bg-emerald-700 px-4 text-base font-extrabold text-white transition-colors hover:bg-emerald-800 disabled:opacity-50"
               >
-                <PhoneCall className="h-4 w-4" />
+                <PhoneCall className="h-5 w-5" />
                 <span>{t.startLiveCall}</span>
               </button>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-2.5">
                 <button
                   type="button"
                   onClick={() => setMicMuted((m) => !m)}
-                  className={`inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold transition-colors ${
+                  className={`inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg border px-4 text-base font-extrabold transition-colors ${
                     micMuted
-                      ? "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100"
-                      : "border-slate-300 bg-white text-slate-900 hover:bg-slate-50"
+                      ? "border-amber-300 bg-amber-50 text-amber-950 hover:bg-amber-100"
+                      : "border-slate-300 bg-white text-slate-950 hover:bg-slate-50"
                   }`}
                 >
-                  {micMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                  {micMuted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
                   <span>{micMuted ? t.unmuteMic : t.muteMic}</span>
                 </button>
                 <button
                   type="button"
                   onClick={stopLiveCall}
-                  className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-red-600 px-4 text-sm font-semibold text-white transition-colors hover:bg-red-700"
+                  className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-red-600 px-4 text-base font-extrabold text-white transition-colors hover:bg-red-700"
                 >
-                  <PhoneOff className="h-4 w-4" />
+                  <PhoneOff className="h-5 w-5" />
                   <span>{t.endLiveCall}</span>
                 </button>
               </div>
             )}
 
-            <div className="space-y-2 pt-2 text-xs text-slate-600">
+            <div className="space-y-2.5 pt-2 text-sm font-bold text-slate-800">
               <label className="flex cursor-pointer items-center justify-between">
                 <span className="flex items-center gap-1.5">
-                  <ShieldCheck className="h-3.5 w-3.5 text-slate-500" />
+                  <ShieldCheck className="h-4 w-4 text-slate-700" />
                   <span>{echoGuard ? t.echoGuardLabel : t.fullDuplexLabel}</span>
                 </span>
                 <input
@@ -829,12 +851,12 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
         </div>
 
         {/* Live Captions, Waveforms & Transcript Feed */}
-        <div className="flex flex-col justify-between rounded-xl border border-slate-200 bg-white lg:col-span-8">
+        <div className="flex flex-col justify-between rounded-xl border border-slate-300 bg-white lg:col-span-8">
           {/* Dual Audio Waveforms + Live Streaming Caption Bar */}
           <div className="space-y-3 border-b border-slate-200 bg-slate-50/70 p-4">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <div className="rounded-lg border border-slate-200 bg-white px-3.5 py-2.5">
-                <div className="mb-1 text-[11px] font-semibold text-slate-500">
+              <div className="rounded-lg border border-slate-300 bg-white px-3.5 py-2.5">
+                <div className="mb-1 text-xs font-extrabold text-slate-800">
                   {uiLang === "am" ? "የእርስዎ ድምፅ (Mic)" : "Your Mic"}
                 </div>
                 <WaveformCanvas
@@ -843,8 +865,8 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                   accentColor="#15803D"
                 />
               </div>
-              <div className="rounded-lg border border-slate-200 bg-white px-3.5 py-2.5">
-                <div className="mb-1 text-[11px] font-semibold text-blue-700">
+              <div className="rounded-lg border border-slate-300 bg-white px-3.5 py-2.5">
+                <div className="mb-1 text-xs font-extrabold text-blue-800">
                   {uiLang === "am" ? "የተተረጎመ የሌላው ድምፅ (Incoming)" : "Incoming Translated Voice"}
                 </div>
                 <WaveformCanvas
@@ -856,17 +878,17 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
             </div>
 
             {liveCaption && (liveCaption.sourceText || liveCaption.translatedText) && (
-              <div className="rounded-lg border border-blue-200 bg-blue-50/60 px-4 py-3">
-                <div className="text-xs font-semibold text-blue-800">
+              <div className="rounded-lg border border-blue-300 bg-blue-50/70 px-4 py-3">
+                <div className="text-sm font-extrabold text-blue-900">
                   {t.liveCaptionsTitle} · {liveCaption.speakerName}
                 </div>
                 {liveCaption.translatedText && (
-                  <p className="mt-1 text-base font-semibold text-slate-900">
+                  <p className="mt-1 text-lg font-bold text-slate-950">
                     {liveCaption.translatedText}
                   </p>
                 )}
                 {liveCaption.sourceText && (
-                  <p className="mt-0.5 text-xs text-slate-600">{liveCaption.sourceText}</p>
+                  <p className="mt-1 text-sm font-semibold text-slate-700">{liveCaption.sourceText}</p>
                 )}
               </div>
             )}
@@ -875,7 +897,7 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           <div className="max-h-[340px] min-h-[220px] space-y-3 overflow-y-auto p-5">
             {messages.length === 0 ? (
               <div className="flex h-full min-h-[180px] flex-col items-center justify-center text-center">
-                <p className="max-w-md text-sm leading-relaxed text-slate-500">
+                <p className="max-w-md text-base font-semibold leading-relaxed text-slate-700">
                   {t.roomSpeakHint}
                 </p>
               </div>
@@ -892,23 +914,23 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                 return (
                   <div
                     key={m.id}
-                    className={`rounded-lg border px-4 py-3 ${
+                    className={`rounded-lg border px-4 py-3.5 ${
                       isMine
-                        ? "border-blue-200 bg-blue-50/40"
-                        : "border-slate-200 bg-slate-50/60"
+                        ? "border-blue-300 bg-blue-50/50"
+                        : "border-slate-300 bg-slate-50/80"
                     }`}
                   >
-                    <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
-                      <span className="truncate font-medium text-slate-700">
+                    <div className="flex items-center justify-between gap-2 text-sm font-bold text-slate-700">
+                      <span className="truncate text-slate-900">
                         {m.speakerName} · {srcLang.nativeName} → {tgtLang.nativeName}
                       </span>
                       <span className="font-mono shrink-0 tabular-nums">{timeStr}</span>
                     </div>
-                    <p className="mt-1.5 text-base font-medium leading-relaxed text-slate-900">
+                    <p className="mt-1.5 text-lg font-bold leading-relaxed text-slate-950">
                       {m.translatedText}
                     </p>
                     {m.sourceText && m.sourceText !== m.translatedText && (
-                      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                      <p className="mt-1 text-sm font-semibold leading-relaxed text-slate-700">
                         {m.sourceText}
                       </p>
                     )}
@@ -917,9 +939,9 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                         <button
                           type="button"
                           onClick={() => void playWavBase64(m.audioWavBase64!)}
-                          className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 hover:text-blue-900"
+                          className="inline-flex items-center gap-1.5 text-sm font-bold text-blue-800 hover:text-blue-950"
                         >
-                          <Volume2 className="h-3.5 w-3.5" />
+                          <Volume2 className="h-4 w-4" />
                           <span>{t.replayAudio}</span>
                         </button>
                       </div>
@@ -932,7 +954,7 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
 
           <div className="border-t border-slate-200 bg-slate-50/70 p-4">
             {errorMsg && (
-              <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              <div className="mb-3 rounded-lg border border-red-300 bg-red-50 px-3.5 py-2.5 text-sm font-bold text-red-900">
                 {errorMsg}
               </div>
             )}
@@ -943,13 +965,13 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                 value={textInput}
                 onChange={(e) => setTextInput(e.target.value)}
                 placeholder={t.typeToSpeak}
-                className="h-11 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:outline-none"
+                className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3.5 text-base font-semibold text-slate-950 placeholder:text-slate-500 focus:border-blue-600 focus:outline-none"
               />
               <button
                 type="submit"
                 disabled={!textInput.trim() || isSendingText || !wsConnected}
                 aria-label={t.sendAndSpeak}
-                className="inline-flex h-11 items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-800 transition-colors hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap shrink-0"
+                className="inline-flex h-11 items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 text-sm font-bold text-slate-950 transition-colors hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap shrink-0"
               >
                 <Send className="h-4 w-4" />
                 <span className="hidden sm:inline">{t.sendAndSpeak}</span>

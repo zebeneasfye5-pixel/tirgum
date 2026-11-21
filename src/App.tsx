@@ -25,6 +25,7 @@ import {
 } from "./data/languages";
 import {
   blobToBase64,
+  createInputAudioContext,
   downsampleTo16k,
   float32ToPcm16Base64,
   GaplessPcmPlayer,
@@ -130,6 +131,9 @@ export default function App() {
   const autoPlayRef = useRef<boolean>(autoPlay);
   const sourceLangRef = useRef<string>(sourceLang);
   const targetLangRef = useRef<string>(targetLang);
+  const userStoppedLiveRef = useRef<boolean>(true);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
 
   // Turn recorder refs
   const turnRecorderRef = useRef<MediaRecorder | null>(null);
@@ -189,6 +193,16 @@ export default function App() {
   }, [targetLang]);
 
   const stopLiveSession = useCallback(() => {
+    userStoppedLiveRef.current = true;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (wakeLockRef.current) {
+      void wakeLockRef.current.release().catch(() => undefined);
+      wakeLockRef.current = null;
+    }
+
     const finalIn = liveInputAccRef.current.trim();
     const finalOut = liveOutputAccRef.current.trim();
     if (finalIn || finalOut) {
@@ -221,8 +235,9 @@ export default function App() {
       inputAudioCtxRef.current = null;
     }
     if (liveWsRef.current) {
-      liveWsRef.current.close();
+      const wsToClose = liveWsRef.current;
       liveWsRef.current = null;
+      wsToClose.close();
     }
     if (playerRef.current) {
       playerRef.current.close();
@@ -239,51 +254,16 @@ export default function App() {
     };
   }, [stopLiveSession]);
 
-  const startLiveSession = useCallback(async () => {
-    setErrorBanner(null);
-    setLiveStatus("connecting");
-    setLiveInputText("");
-    setLiveOutputText("");
-    liveInputAccRef.current = "";
-    liveOutputAccRef.current = "";
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      inputStreamRef.current = stream;
-
-      const player = new GaplessPcmPlayer();
-      player.setMuted(!autoPlayRef.current);
-      const { analyser: outAnal } = player.ensureContext();
-      playerRef.current = player;
-      setOutputAnalyser(outAnal);
-
-      const inputCtx = new AudioContext({ sampleRate: 16000 });
-      if (inputCtx.state === "suspended") {
-        await inputCtx.resume();
+  const openLiveSocket = useCallback(
+    (inputCtx: AudioContext, processor: ScriptProcessorNode) => {
+      if (userStoppedLiveRef.current) return;
+      if (liveWsRef.current) {
+        try {
+          liveWsRef.current.close();
+        } catch {
+          // ignore
+        }
       }
-      inputAudioCtxRef.current = inputCtx;
-
-      const sourceNode = inputCtx.createMediaStreamSource(stream);
-      const inAnal = inputCtx.createAnalyser();
-      inAnal.fftSize = 256;
-      sourceNode.connect(inAnal);
-      setInputAnalyser(inAnal);
-
-      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-
-      // Silent sink so ScriptProcessorNode fires without microphone loopback echo
-      const silentGain = inputCtx.createGain();
-      silentGain.gain.value = 0;
-      sourceNode.connect(processor);
-      processor.connect(silentGain);
-      silentGain.connect(inputCtx.destination);
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const params = new URLSearchParams({
@@ -292,12 +272,17 @@ export default function App() {
         voiceName,
         bidirectional: String(bidirectional && sourceLang !== "auto"),
       });
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws/live?${params.toString()}`);
+      const ws = new WebSocket(
+        `${protocol}//${window.location.host}/ws/live?${params.toString()}`
+      );
       liveWsRef.current = ws;
 
       ws.onopen = () => {
         processor.onaudioprocess = (e) => {
-          if (ws.readyState !== WebSocket.OPEN) return;
+          if (ws.readyState !== WebSocket.OPEN || userStoppedLiveRef.current) return;
+          if (inputCtx.state === "suspended") {
+            void inputCtx.resume();
+          }
           const rawChannel = e.inputBuffer.getChannelData(0);
           const pcm16k = downsampleTo16k(rawChannel, inputCtx.sampleRate);
           const base64 = float32ToPcm16Base64(pcm16k);
@@ -311,8 +296,7 @@ export default function App() {
           if (msg.type === "status") {
             if (msg.connected) {
               setLiveStatus("active");
-            } else {
-              stopLiveSession();
+              setErrorBanner(null);
             }
           } else if (msg.type === "inputTranscript" && msg.text) {
             liveInputAccRef.current += msg.text;
@@ -322,6 +306,8 @@ export default function App() {
             setLiveOutputText(liveOutputAccRef.current);
           } else if (msg.type === "audio" && msg.data) {
             playerRef.current?.enqueuePcm24kBase64(msg.data);
+          } else if (msg.type === "audioWav" && msg.data) {
+            void playerRef.current?.enqueueWavBase64(msg.data);
           } else if (msg.type === "interrupted") {
             playerRef.current?.interrupt();
           } else if (msg.type === "turnComplete") {
@@ -352,28 +338,88 @@ export default function App() {
       };
 
       ws.onerror = () => {
-        setErrorBanner(t.errorGeneric);
-        stopLiveSession();
+        // Reconnection handled in onclose while userStoppedLiveRef is false
       };
 
       ws.onclose = () => {
-        if (liveWsRef.current === ws) {
-          stopLiveSession();
+        if (!userStoppedLiveRef.current && liveWsRef.current === ws) {
+          setLiveStatus("connecting");
+          reconnectTimerRef.current = setTimeout(() => {
+            if (!userStoppedLiveRef.current && inputAudioCtxRef.current && processorRef.current) {
+              openLiveSocket(inputAudioCtxRef.current, processorRef.current);
+            }
+          }, 1500);
         }
       };
+    },
+    [bidirectional, sourceLang, targetLang, voiceName, stopLiveSession, t.errorGeneric]
+  );
+
+  const startLiveSession = useCallback(async () => {
+    setErrorBanner(null);
+    userStoppedLiveRef.current = false;
+    setLiveStatus("connecting");
+    setLiveInputText("");
+    setLiveOutputText("");
+    liveInputAccRef.current = "";
+    liveOutputAccRef.current = "";
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (userStoppedLiveRef.current) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+      inputStreamRef.current = stream;
+
+      if ("wakeLock" in navigator) {
+        void (navigator as Navigator & {
+          wakeLock?: { request: (type: string) => Promise<{ release: () => Promise<void> }> };
+        }).wakeLock
+          ?.request("screen")
+          .then((lock) => {
+            wakeLockRef.current = lock;
+          })
+          .catch(() => undefined);
+      }
+
+      const player = new GaplessPcmPlayer();
+      player.setMuted(!autoPlayRef.current);
+      const { analyser: outAnal } = player.ensureContext();
+      playerRef.current = player;
+      setOutputAnalyser(outAnal);
+
+      const inputCtx = await createInputAudioContext();
+      inputAudioCtxRef.current = inputCtx;
+
+      const sourceNode = inputCtx.createMediaStreamSource(stream);
+      const inAnal = inputCtx.createAnalyser();
+      inAnal.fftSize = 256;
+      sourceNode.connect(inAnal);
+      setInputAnalyser(inAnal);
+
+      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      // Silent sink so ScriptProcessorNode fires without microphone loopback echo
+      const silentGain = inputCtx.createGain();
+      silentGain.gain.value = 0;
+      sourceNode.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(inputCtx.destination);
+
+      openLiveSocket(inputCtx, processor);
     } catch {
       setErrorBanner(t.errorMicDenied);
       stopLiveSession();
     }
-  }, [
-    bidirectional,
-    sourceLang,
-    targetLang,
-    voiceName,
-    stopLiveSession,
-    t.errorGeneric,
-    t.errorMicDenied,
-  ]);
+  }, [openLiveSocket, stopLiveSession, t.errorMicDenied]);
 
   const executeTurnTranslation = useCallback(
     async (payload: { audioBase64?: string; mimeType?: string; text?: string }) => {
@@ -580,44 +626,44 @@ export default function App() {
   const targetLangObj = getLanguageByCode(targetLang);
 
   return (
-    <div className="min-h-screen bg-[#F7F8FA] text-[#0F172A]">
+    <div className="min-h-screen bg-[#F7F8FA] text-slate-950 font-medium">
       {/* Top Bar Contract: 3 exact zones separated by gap-8 */}
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-8 px-6 py-4">
           <a
             href="#studio"
-            className="font-display text-xl font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
+            className="font-display text-2xl font-extrabold tracking-tight text-slate-950 whitespace-nowrap shrink-0"
           >
             {t.brand}
           </a>
 
           <nav
             aria-label="Primary"
-            className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600"
+            className="hidden md:flex items-center gap-7 text-base font-bold text-slate-800"
           >
             <a
               href="#studio"
               onClick={() => handleModeSwitch("face")}
-              className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+              className="hover:text-blue-700 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
               {t.navStudio}
             </a>
             <a
               href="#studio"
               onClick={() => handleModeSwitch("room")}
-              className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+              className="hover:text-blue-700 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
               {t.navRooms}
             </a>
             <a
               href="#history"
-              className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+              className="hover:text-blue-700 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
               {t.navHistory}
             </a>
             <a
               href="#languages"
-              className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+              className="hover:text-blue-700 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
               {t.navLanguages}
             </a>
@@ -632,7 +678,7 @@ export default function App() {
                   void startLiveSession();
                 }
               }}
-              className="inline-flex h-10 items-center justify-center rounded-lg bg-blue-700 px-4 text-xs font-semibold text-white transition-colors hover:bg-blue-800 whitespace-nowrap shrink-0"
+              className="inline-flex h-11 items-center justify-center rounded-lg bg-blue-700 px-5 text-sm font-bold text-white transition-colors hover:bg-blue-800 whitespace-nowrap shrink-0"
             >
               {t.navStart}
             </a>
@@ -646,16 +692,16 @@ export default function App() {
           <div className="flex flex-col justify-between gap-6 lg:flex-row lg:items-end">
             <div className="max-w-2xl space-y-3">
               <h1
-                className="font-display font-bold tracking-tight text-slate-900"
+                className="font-display font-extrabold tracking-tight text-slate-950"
                 style={{
-                  fontSize: "clamp(1.85rem, 3.2vw, 2.75rem)",
+                  fontSize: "clamp(1.95rem, 3.4vw, 2.85rem)",
                   lineHeight: 1.18,
                   textWrap: "balance",
                 }}
               >
                 {t.heroTitle}
               </h1>
-              <p className="text-base leading-relaxed text-slate-600">
+              <p className="text-lg font-semibold leading-relaxed text-slate-700">
                 {t.heroSubtitle}
               </p>
             </div>
@@ -664,14 +710,14 @@ export default function App() {
             <div className="flex flex-wrap items-center gap-3 shrink-0">
               <PWAInstallButton uiLang={uiLang} />
 
-              <div className="inline-flex items-center rounded-lg border border-slate-200 bg-white p-1">
+              <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white p-1">
                 <button
                   type="button"
                   onClick={() => handleModeSwitch("face")}
-                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  className={`rounded-md px-3.5 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                     studioMode === "face"
                       ? "bg-slate-900 text-white"
-                      : "text-slate-600 hover:text-slate-900"
+                      : "text-slate-700 hover:text-slate-950"
                   }`}
                 >
                   {t.modeFaceToFace}
@@ -679,24 +725,24 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => handleModeSwitch("room")}
-                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  className={`rounded-md px-3.5 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                     studioMode === "room"
                       ? "bg-slate-900 text-white"
-                      : "text-slate-600 hover:text-slate-900"
+                      : "text-slate-700 hover:text-slate-950"
                   }`}
                 >
                   {t.modeRemoteRoom}
                 </button>
               </div>
 
-              <div className="inline-flex items-center rounded-lg border border-slate-200 bg-white p-1">
+              <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white p-1">
                 <button
                   type="button"
                   onClick={() => setUiLang("am")}
-                  className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  className={`rounded-md px-3 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                     uiLang === "am"
                       ? "bg-blue-700 text-white"
-                      : "text-slate-600 hover:text-slate-900"
+                      : "text-slate-700 hover:text-slate-950"
                   }`}
                 >
                   አማርኛ
@@ -704,10 +750,10 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setUiLang("en")}
-                  className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  className={`rounded-md px-3 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                     uiLang === "en"
                       ? "bg-blue-700 text-white"
-                      : "text-slate-600 hover:text-slate-900"
+                      : "text-slate-700 hover:text-slate-950"
                   }`}
                 >
                   English
@@ -721,16 +767,16 @@ export default function App() {
           ) : (
             <div className="space-y-4">
               {/* Sub-toolbar for Face-to-Face Engine & Voice */}
-              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-5 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-300 bg-white px-5 py-3.5">
                 <div className="flex flex-wrap items-center gap-3">
                   <div className="inline-flex items-center rounded-lg bg-slate-100 p-1">
                     <button
                       type="button"
                       onClick={() => handleEngineSwitch("live")}
-                      className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                      className={`rounded-md px-3.5 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                         engineMode === "live"
-                          ? "bg-white text-slate-900 shadow-xs"
-                          : "text-slate-600 hover:text-slate-900"
+                          ? "bg-white text-slate-950 shadow-xs"
+                          : "text-slate-700 hover:text-slate-950"
                       }`}
                     >
                       {t.engineContinuous}
@@ -738,24 +784,24 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => handleEngineSwitch("turn")}
-                      className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                      className={`rounded-md px-3.5 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                         engineMode === "turn"
-                          ? "bg-white text-slate-900 shadow-xs"
-                          : "text-slate-600 hover:text-slate-900"
+                          ? "bg-white text-slate-950 shadow-xs"
+                          : "text-slate-700 hover:text-slate-950"
                       }`}
                     >
                       {t.engineTurn}
                     </button>
                   </div>
 
-                  <div className="flex items-center gap-2 text-xs font-medium text-slate-600">
+                  <div className="flex items-center gap-2 text-sm font-bold text-slate-800">
                     <span
-                      className={`h-2 w-2 rounded-full ${
+                      className={`h-2.5 w-2.5 rounded-full ${
                         liveStatus === "active" || turnRecording
                           ? "bg-red-600"
                           : liveStatus === "connecting" || turnProcessing
                           ? "bg-amber-500"
-                          : "bg-slate-300"
+                          : "bg-slate-400"
                       }`}
                       aria-hidden="true"
                     />
@@ -771,7 +817,7 @@ export default function App() {
                         : t.readyState}
                     </span>
                     {liveStatus === "active" && (
-                      <span className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
+                      <span className="font-mono text-sm font-bold text-slate-950 tabular-nums">
                         · {formatDuration(liveSeconds)}
                       </span>
                     )}
@@ -787,23 +833,23 @@ export default function App() {
                         setBidirectional((b) => !b);
                       }}
                       aria-pressed={bidirectional}
-                      className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                      className={`inline-flex h-10 items-center gap-1.5 rounded-lg border px-3.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                         bidirectional
-                          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                          ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+                          : "border-slate-300 bg-white text-slate-800 hover:bg-slate-50"
                       }`}
                     >
-                      <ArrowLeftRight className="h-3.5 w-3.5" />
+                      <ArrowLeftRight className="h-4 w-4" />
                       <span>{bidirectional ? t.twoWayAutoLabel : t.oneWayLabel}</span>
                     </button>
                   )}
 
-                  <label className="flex items-center gap-2 text-xs font-medium text-slate-600">
+                  <label className="flex items-center gap-2 text-sm font-bold text-slate-800">
                     <span>{t.voiceLabel}</span>
                     <select
                       value={voiceName}
                       onChange={(e) => setVoiceName(e.target.value as VoiceId)}
-                      className="h-9 rounded-lg border border-slate-200 bg-slate-50 px-2.5 text-xs font-semibold text-slate-900 focus:border-blue-600 focus:outline-none"
+                      className="h-10 rounded-lg border border-slate-300 bg-slate-50 px-3 text-sm font-bold text-slate-950 focus:border-blue-600 focus:outline-none"
                     >
                       {VOICE_PROFILES.map((v) => (
                         <option key={v.id} value={v.id}>
@@ -817,16 +863,16 @@ export default function App() {
                     type="button"
                     onClick={() => setAutoPlay((v) => !v)}
                     aria-pressed={autoPlay}
-                    className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                    className={`inline-flex h-10 items-center gap-1.5 rounded-lg border px-3.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                       autoPlay
-                        ? "border-blue-200 bg-blue-50 text-blue-800"
-                        : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                        ? "border-blue-300 bg-blue-50 text-blue-900"
+                        : "border-slate-300 bg-white text-slate-800 hover:bg-slate-50"
                     }`}
                   >
                     {autoPlay ? (
-                      <Volume2 className="h-3.5 w-3.5" />
+                      <Volume2 className="h-4 w-4" />
                     ) : (
-                      <VolumeX className="h-3.5 w-3.5" />
+                      <VolumeX className="h-4 w-4" />
                     )}
                     <span>{t.autoPlayAudio}</span>
                   </button>
@@ -834,8 +880,8 @@ export default function App() {
               </div>
 
               {/* Quick Language Pair Presets */}
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-medium text-slate-500">{t.quickPairsLabel}:</span>
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-bold text-slate-700">{t.quickPairsLabel}:</span>
                 {QUICK_PAIRS.map((pair) => {
                   const isActive =
                     (sourceLang === pair.from && targetLang === pair.to) ||
@@ -849,10 +895,10 @@ export default function App() {
                         setSourceLang(pair.from);
                         setTargetLang(pair.to);
                       }}
-                      className={`rounded-md border px-2.5 py-1 font-medium transition-colors whitespace-nowrap shrink-0 ${
+                      className={`rounded-md border px-3 py-1.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                         isActive
                           ? "border-slate-900 bg-slate-900 text-white"
-                          : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+                          : "border-slate-300 bg-white text-slate-800 hover:border-slate-400 hover:bg-slate-50"
                       }`}
                     >
                       {pair.label}
@@ -864,7 +910,7 @@ export default function App() {
               {errorBanner && (
                 <div
                   role="alert"
-                  className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+                  className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-base font-bold text-red-900"
                 >
                   {errorBanner}
                 </div>
@@ -873,16 +919,16 @@ export default function App() {
               {/* Dual-Channel Studio Grid (Speaker <-> Listener) */}
               <div className="grid grid-cols-1 items-stretch gap-4 lg:grid-cols-[1fr_auto_1fr]">
                 {/* Speaker Panel */}
-                <div className="flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-6">
+                <div className="flex flex-col justify-between rounded-xl border border-slate-300 bg-white p-6">
                   <div className="space-y-4">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                      <span className="text-sm font-extrabold uppercase tracking-wider text-slate-800">
                         {t.speakerLabel}
                       </span>
                       <button
                         type="button"
                         onClick={() => setPickerTarget("source")}
-                        className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3.5 text-sm font-semibold text-slate-900 transition-colors hover:border-slate-300 hover:bg-white whitespace-nowrap shrink-0"
+                        className="inline-flex h-11 items-center gap-2 rounded-lg border border-slate-300 bg-slate-50 px-4 text-base font-bold text-slate-950 transition-colors hover:border-slate-400 hover:bg-white whitespace-nowrap shrink-0"
                       >
                         <span>
                           {sourceLangObj
@@ -893,11 +939,11 @@ export default function App() {
                               }`
                             : t.autoDetect}
                         </span>
-                        <ChevronDown className="h-4 w-4 text-slate-400" />
+                        <ChevronDown className="h-4 w-4 text-slate-700" />
                       </button>
                     </div>
 
-                    <div className="border-t border-slate-100 pt-4">
+                    <div className="border-t border-slate-200 pt-4">
                       <WaveformCanvas
                         analyser={inputAnalyser}
                         active={liveStatus === "active" || turnRecording}
@@ -907,38 +953,38 @@ export default function App() {
 
                     <div className="min-h-[150px] py-2">
                       {liveInputText ? (
-                        <p className="text-lg font-medium leading-relaxed text-slate-900">
+                        <p className="text-xl sm:text-2xl font-bold leading-relaxed text-slate-950">
                           {liveInputText}
                         </p>
                       ) : (
-                        <p className="text-sm leading-relaxed text-slate-400">
+                        <p className="text-base font-semibold leading-relaxed text-slate-600">
                           {t.speakerPlaceholder}
                         </p>
                       )}
                     </div>
                   </div>
 
-                  <div className="space-y-3 border-t border-slate-100 pt-4">
+                  <div className="space-y-3 border-t border-slate-200 pt-4">
                     {engineMode === "live" ? (
                       <button
                         type="button"
                         onClick={
                           liveStatus === "idle" ? startLiveSession : stopLiveSession
                         }
-                        className={`inline-flex h-12 w-full items-center justify-center gap-2.5 rounded-lg px-5 text-sm font-semibold text-white transition-colors ${
+                        className={`inline-flex h-14 w-full items-center justify-center gap-2.5 rounded-lg px-5 text-base font-extrabold text-white transition-colors ${
                           liveStatus === "active"
                             ? "bg-red-600 hover:bg-red-700"
                             : liveStatus === "connecting"
-                            ? "bg-slate-700 hover:bg-slate-800"
+                            ? "bg-slate-800 hover:bg-slate-900"
                             : "bg-blue-700 hover:bg-blue-800"
                         }`}
                       >
                         {liveStatus === "connecting" ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <Loader2 className="h-5 w-5 animate-spin" />
                         ) : liveStatus === "active" ? (
-                          <MicOff className="h-4 w-4" />
+                          <MicOff className="h-5 w-5" />
                         ) : (
-                          <Mic className="h-4 w-4" />
+                          <Mic className="h-5 w-5" />
                         )}
                         <span>
                           {liveStatus === "connecting"
@@ -955,18 +1001,18 @@ export default function App() {
                           turnRecording ? stopTurnRecording : startTurnRecording
                         }
                         disabled={turnProcessing}
-                        className={`inline-flex h-12 w-full items-center justify-center gap-2.5 rounded-lg px-5 text-sm font-semibold text-white transition-colors disabled:opacity-50 ${
+                        className={`inline-flex h-14 w-full items-center justify-center gap-2.5 rounded-lg px-5 text-base font-extrabold text-white transition-colors disabled:opacity-50 ${
                           turnRecording
                             ? "bg-red-600 hover:bg-red-700"
                             : "bg-blue-700 hover:bg-blue-800"
                         }`}
                       >
                         {turnProcessing ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <Loader2 className="h-5 w-5 animate-spin" />
                         ) : turnRecording ? (
-                          <Square className="h-4 w-4 fill-current" />
+                          <Square className="h-5 w-5 fill-current" />
                         ) : (
-                          <Mic className="h-4 w-4" />
+                          <Mic className="h-5 w-5" />
                         )}
                         <span>
                           {turnProcessing
@@ -984,14 +1030,14 @@ export default function App() {
                         value={phraseInput}
                         onChange={(e) => setPhraseInput(e.target.value)}
                         placeholder={t.typeToSpeak}
-                        className="h-10 min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:bg-white focus:outline-none"
+                        className="h-11 min-w-0 flex-1 rounded-lg border border-slate-300 bg-slate-50 px-3.5 text-base font-semibold text-slate-950 placeholder:text-slate-500 focus:border-blue-600 focus:bg-white focus:outline-none"
                       />
                       <button
                         type="submit"
                         disabled={!phraseInput.trim() || turnProcessing}
-                        className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
+                        className="inline-flex h-11 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-4 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
                       >
-                        <Send className="h-3.5 w-3.5" />
+                        <Send className="h-4 w-4" />
                         <span>{t.sendAndSpeak}</span>
                       </button>
                     </form>
@@ -1005,23 +1051,23 @@ export default function App() {
                     onClick={handleSwapLanguages}
                     title={t.swapLanguages}
                     aria-label={t.swapLanguages}
-                    className="flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 transition-colors hover:border-blue-600 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
+                    className="flex h-12 w-12 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-800 transition-colors hover:border-blue-600 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
                   >
-                    <ArrowLeftRight className="h-4 w-4" />
+                    <ArrowLeftRight className="h-5 w-5" />
                   </button>
                 </div>
 
                 {/* Listener Panel */}
-                <div className="flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-6">
+                <div className="flex flex-col justify-between rounded-xl border border-slate-300 bg-white p-6">
                   <div className="space-y-4">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs font-semibold uppercase tracking-wider text-blue-700">
+                      <span className="text-sm font-extrabold uppercase tracking-wider text-blue-800">
                         {t.listenerLabel}
                       </span>
                       <button
                         type="button"
                         onClick={() => setPickerTarget("target")}
-                        className="inline-flex h-10 items-center gap-2 rounded-lg border border-blue-200 bg-blue-50/70 px-3.5 text-sm font-semibold text-blue-900 transition-colors hover:border-blue-300 hover:bg-blue-50 whitespace-nowrap shrink-0"
+                        className="inline-flex h-11 items-center gap-2 rounded-lg border border-blue-300 bg-blue-50 px-4 text-base font-bold text-blue-950 transition-colors hover:border-blue-400 hover:bg-blue-100 whitespace-nowrap shrink-0"
                       >
                         <span>
                           {targetLangObj.nativeName} ·{" "}
@@ -1029,11 +1075,11 @@ export default function App() {
                             ? targetLangObj.amharicName
                             : targetLangObj.name}
                         </span>
-                        <ChevronDown className="h-4 w-4 text-blue-700" />
+                        <ChevronDown className="h-4 w-4 text-blue-800" />
                       </button>
                     </div>
 
-                    <div className="border-t border-slate-100 pt-4">
+                    <div className="border-t border-slate-200 pt-4">
                       <WaveformCanvas
                         analyser={outputAnalyser}
                         active={liveStatus === "active" && Boolean(liveOutputText)}
@@ -1043,19 +1089,19 @@ export default function App() {
 
                     <div className="min-h-[150px] py-2">
                       {liveOutputText ? (
-                        <p className="text-xl font-semibold leading-relaxed text-slate-900">
+                        <p className="text-xl sm:text-2xl font-bold leading-relaxed text-slate-950">
                           {liveOutputText}
                         </p>
                       ) : (
-                        <p className="text-sm leading-relaxed text-slate-400">
+                        <p className="text-base font-semibold leading-relaxed text-slate-600">
                           {t.listenerPlaceholder}
                         </p>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between border-t border-slate-100 pt-4">
-                    <div className="text-xs text-slate-500">
+                  <div className="flex items-center justify-between border-t border-slate-200 pt-4">
+                    <div className="text-sm font-bold text-slate-700">
                       {targetLangObj.nativeName} ·{" "}
                       <span className="font-mono uppercase">{targetLangObj.code}</span>
                     </div>
@@ -1065,9 +1111,9 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => void playWavBase64(lastTurnAudio)}
-                          className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap"
+                          className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap"
                         >
-                          <Volume2 className="h-3.5 w-3.5 text-blue-700" />
+                          <Volume2 className="h-4 w-4 text-blue-700" />
                           <span>{t.replayAudio}</span>
                         </button>
                       )}
@@ -1075,12 +1121,12 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => void handleCopyText("current", liveOutputText)}
-                          className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 whitespace-nowrap"
+                          className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap"
                         >
                           {copiedId === "current" ? (
-                            <Check className="h-3.5 w-3.5 text-emerald-700" />
+                            <Check className="h-4 w-4 text-emerald-700" />
                           ) : (
-                            <Copy className="h-3.5 w-3.5" />
+                            <Copy className="h-4 w-4" />
                           )}
                           <span>{copiedId === "current" ? t.copied : t.copyText}</span>
                         </button>
@@ -1095,31 +1141,31 @@ export default function App() {
 
         {/* How It Works */}
         <section id="how-it-works" className="border-t border-slate-200 pt-10">
-          <h2 className="font-display text-xl font-semibold text-slate-900">
+          <h2 className="font-display text-2xl font-extrabold text-slate-950">
             {t.howItWorksTitle}
           </h2>
           <div className="mt-5 grid grid-cols-1 gap-6 md:grid-cols-3">
-            <div className="rounded-xl border border-slate-200 bg-white p-5">
-              <h3 className="font-display text-base font-semibold text-slate-900">
+            <div className="rounded-xl border border-slate-300 bg-white p-6">
+              <h3 className="font-display text-lg font-extrabold text-slate-950">
                 {t.step1Title}
               </h3>
-              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+              <p className="mt-2.5 text-base font-semibold leading-relaxed text-slate-700">
                 {t.step1Desc}
               </p>
             </div>
-            <div className="rounded-xl border border-slate-200 bg-white p-5">
-              <h3 className="font-display text-base font-semibold text-slate-900">
+            <div className="rounded-xl border border-slate-300 bg-white p-6">
+              <h3 className="font-display text-lg font-extrabold text-slate-950">
                 {t.step2Title}
               </h3>
-              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+              <p className="mt-2.5 text-base font-semibold leading-relaxed text-slate-700">
                 {t.step2Desc}
               </p>
             </div>
-            <div className="rounded-xl border border-slate-200 bg-white p-5">
-              <h3 className="font-display text-base font-semibold text-slate-900">
+            <div className="rounded-xl border border-slate-300 bg-white p-6">
+              <h3 className="font-display text-lg font-extrabold text-slate-950">
                 {t.step3Title}
               </h3>
-              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+              <p className="mt-2.5 text-base font-semibold leading-relaxed text-slate-700">
                 {t.step3Desc}
               </p>
             </div>
@@ -1129,7 +1175,7 @@ export default function App() {
         {/* Session Transcript History */}
         <section id="history" className="border-t border-slate-200 pt-10">
           <div className="flex items-center justify-between gap-4">
-            <h2 className="font-display text-xl font-semibold text-slate-900">
+            <h2 className="font-display text-2xl font-extrabold text-slate-950">
               {t.historyTitle}
             </h2>
             {history.length > 0 && (
@@ -1137,17 +1183,17 @@ export default function App() {
                 <button
                   type="button"
                   onClick={exportHistory}
-                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 whitespace-nowrap"
+                  className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap"
                 >
-                  <Download className="h-3.5 w-3.5" />
+                  <Download className="h-4 w-4" />
                   <span>{t.exportTranscript}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setHistory([])}
-                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 whitespace-nowrap"
+                  className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap"
                 >
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <Trash2 className="h-4 w-4" />
                   <span>{t.clearHistory}</span>
                 </button>
               </div>
@@ -1155,11 +1201,11 @@ export default function App() {
           </div>
 
           {history.length === 0 ? (
-            <div className="mt-4 rounded-xl border border-slate-200 bg-white px-6 py-10 text-center">
-              <p className="text-sm text-slate-500">{t.historyEmpty}</p>
+            <div className="mt-4 rounded-xl border border-slate-300 bg-white px-6 py-10 text-center">
+              <p className="text-base font-semibold text-slate-700">{t.historyEmpty}</p>
             </div>
           ) : (
-            <div className="mt-4 divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="mt-4 divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-300 bg-white">
               {history.map((item) => {
                 const srcLabel =
                   item.sourceLang === "auto"
@@ -1176,19 +1222,19 @@ export default function App() {
                     key={item.id}
                     className="flex flex-col justify-between gap-4 px-6 py-4 sm:flex-row sm:items-start"
                   >
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <div className="min-w-0 flex-1 space-y-1.5">
+                      <div className="flex items-center gap-2 text-sm font-bold text-slate-700">
                         <span>{srcLabel}</span>
                         <span aria-hidden="true">→</span>
-                        <span className="font-medium text-slate-700">{tgtLabel}</span>
+                        <span className="text-blue-800">{tgtLabel}</span>
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums">{timeStr}</span>
                       </div>
-                      <p className="text-base font-semibold text-slate-900">
+                      <p className="text-lg font-bold text-slate-950">
                         {item.translatedText}
                       </p>
                       {item.sourceText && (
-                        <p className="text-sm text-slate-600">{item.sourceText}</p>
+                        <p className="text-base font-semibold text-slate-700">{item.sourceText}</p>
                       )}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
@@ -1196,21 +1242,21 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => void playWavBase64(item.audioWavBase64!)}
-                          className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 text-xs font-semibold text-slate-800 hover:bg-slate-100 whitespace-nowrap"
+                          className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-3.5 text-sm font-bold text-slate-900 hover:bg-slate-100 whitespace-nowrap"
                         >
-                          <Volume2 className="h-3.5 w-3.5 text-blue-700" />
+                          <Volume2 className="h-4 w-4 text-blue-700" />
                           <span>{t.replayAudio}</span>
                         </button>
                       )}
                       <button
                         type="button"
                         onClick={() => void handleCopyText(item.id, item.translatedText)}
-                        className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                        className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 hover:bg-slate-50 whitespace-nowrap"
                       >
                         {copiedId === item.id ? (
-                          <Check className="h-3.5 w-3.5 text-emerald-700" />
+                          <Check className="h-4 w-4 text-emerald-700" />
                         ) : (
-                          <Copy className="h-3.5 w-3.5" />
+                          <Copy className="h-4 w-4" />
                         )}
                         <span>{copiedId === item.id ? t.copied : t.copyText}</span>
                       </button>
@@ -1226,35 +1272,35 @@ export default function App() {
         <section id="languages" className="border-t border-slate-200 pt-10">
           <div className="flex flex-col justify-between gap-4 md:flex-row md:items-end">
             <div>
-              <h2 className="flex items-center gap-2 font-display text-xl font-semibold text-slate-900">
-                <Globe className="h-5 w-5 text-blue-700" />
+              <h2 className="flex items-center gap-2 font-display text-2xl font-extrabold text-slate-950">
+                <Globe className="h-6 w-6 text-blue-700" />
                 <span>{t.languagesTitle}</span>
               </h2>
-              <p className="mt-1 text-sm text-slate-600">{t.languagesSubtitle}</p>
+              <p className="mt-1.5 text-base font-semibold text-slate-700">{t.languagesSubtitle}</p>
             </div>
 
             <div className="relative w-full md:w-72">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
               <input
                 type="text"
                 value={atlasQuery}
                 onChange={(e) => setAtlasQuery(e.target.value)}
                 placeholder={t.searchLanguage}
-                className="h-10 w-full rounded-lg border border-slate-200 bg-white pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:outline-none"
+                className="h-11 w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 text-base font-semibold text-slate-950 placeholder:text-slate-500 focus:border-blue-600 focus:outline-none"
               />
             </div>
           </div>
 
-          <div className="mt-4 flex flex-wrap items-center gap-1.5">
+          <div className="mt-4 flex flex-wrap items-center gap-2">
             {ATLAS_REGIONS.map((r) => (
               <button
                 key={r}
                 type="button"
                 onClick={() => setAtlasRegion(r)}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                className={`rounded-md px-3.5 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
                   atlasRegion === r
                     ? "bg-slate-900 text-white"
-                    : "border border-slate-200 bg-white text-slate-600 hover:text-slate-900"
+                    : "border border-slate-300 bg-white text-slate-800 hover:text-slate-950"
                 }`}
               >
                 {r === "All" ? t.allRegions : r}
@@ -1262,21 +1308,21 @@ export default function App() {
             ))}
           </div>
 
-          <div className="mt-5 grid grid-cols-1 gap-2.5 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
             {filteredAtlas.map((lang) => (
               <div
                 key={lang.code}
-                className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-3"
+                className="flex items-center justify-between rounded-lg border border-slate-300 bg-white px-4 py-3.5"
               >
                 <div className="min-w-0 pr-2">
-                  <div className="truncate text-sm font-semibold text-slate-900">
+                  <div className="truncate text-base font-extrabold text-slate-950">
                     {lang.nativeName}
                   </div>
-                  <div className="truncate text-xs text-slate-500">
+                  <div className="truncate text-sm font-semibold text-slate-700">
                     {uiLang === "am" ? `${lang.amharicName} · ${lang.name}` : lang.name}
                   </div>
                 </div>
-                <div className="flex shrink-0 items-center gap-1">
+                <div className="flex shrink-0 items-center gap-1.5">
                   <button
                     type="button"
                     onClick={() => {
@@ -1286,10 +1332,10 @@ export default function App() {
                       window.scrollTo({ top: 0, behavior: "smooth" });
                     }}
                     title={t.speakerLabel}
-                    className={`rounded px-2 py-1 text-[11px] font-semibold transition-colors ${
+                    className={`rounded px-2.5 py-1.5 text-xs font-bold transition-colors ${
                       sourceLang === lang.code
                         ? "bg-slate-900 text-white"
-                        : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                        : "bg-slate-100 text-slate-800 hover:bg-slate-200"
                     }`}
                   >
                     {uiLang === "am" ? "ተናጋሪ" : "In"}
@@ -1303,10 +1349,10 @@ export default function App() {
                       window.scrollTo({ top: 0, behavior: "smooth" });
                     }}
                     title={t.listenerLabel}
-                    className={`rounded px-2 py-1 text-[11px] font-semibold transition-colors ${
+                    className={`rounded px-2.5 py-1.5 text-xs font-bold transition-colors ${
                       targetLang === lang.code
                         ? "bg-blue-700 text-white"
-                        : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                        : "bg-slate-100 text-slate-800 hover:bg-slate-200"
                     }`}
                   >
                     {uiLang === "am" ? "አድማጭ" : "Out"}
@@ -1319,8 +1365,8 @@ export default function App() {
       </main>
 
       <footer className="mt-16 border-t border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-6 py-6 text-xs text-slate-500 sm:flex-row">
-          <div className="font-display font-semibold text-slate-800">{t.brand}</div>
+        <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-6 py-6 text-sm font-bold text-slate-700 sm:flex-row">
+          <div className="font-display text-base font-extrabold text-slate-950">{t.brand}</div>
           <div>
             {uiLang === "am"
               ? "በቀጥታ ድምፅ የዓለምን ቋንቋዎች የሚያገናኝ መድረክ"

@@ -46,9 +46,44 @@ function getAiClient(): GoogleGenAI {
   });
 }
 
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const rec = err as Record<string, unknown>;
+    if (typeof rec.message === "string" && rec.message) return rec.message;
+    if (rec.error) {
+      const nested = extractErrorMessage(rec.error);
+      if (nested && nested !== "[object Object]") return nested;
+    }
+    try {
+      const json = JSON.stringify(err);
+      if (json && json !== "{}") return json;
+    } catch {
+      // ignore
+    }
+  }
+  return String(err || "Unknown error");
+}
+
+function isFatalAuthError(msg: string): boolean {
+  const upper = msg.toUpperCase();
+  return (
+    upper.includes("API_KEY_INVALID") ||
+    upper.includes("PERMISSION_DENIED") ||
+    upper.includes("GEMINI_API_KEY IS NOT CONFIGURED") ||
+    (upper.includes("403") && upper.includes("API"))
+  );
+}
+
+function isTransientOverloadError(err: unknown): boolean {
+  const msg = extractErrorMessage(err).toUpperCase();
+  return msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("HIGH DEMAND");
+}
+
 function formatApiError(err: unknown): { status: number; message: string } {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (msg.includes("403") || msg.includes("PERMISSION_DENIED") || msg.includes("API_KEY_INVALID")) {
+  const msg = extractErrorMessage(err);
+  if (isFatalAuthError(msg)) {
     return {
       status: 403,
       message: "Gemini API key permission or configuration error. Please check Settings > Secrets.",
@@ -60,7 +95,44 @@ function formatApiError(err: unknown): { status: number; message: string } {
       message: "Rate limit reached. Please wait a moment and try again.",
     };
   }
+  if (msg.includes("503") || msg.includes("UNAVAILABLE")) {
+    return {
+      status: 503,
+      message: "Translation service is temporarily busy. Retrying automatically...",
+    };
+  }
   return { status: 500, message: msg || "Translation request failed." };
+}
+
+function computePcm16Rms(pcmBuffer: Buffer): number {
+  const sampleCount = Math.floor(pcmBuffer.length / 2);
+  if (sampleCount === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const sample = pcmBuffer.readInt16LE(i * 2) / 32768;
+    sumSq += sample * sample;
+  }
+  return Math.sqrt(sumSq / sampleCount);
+}
+
+function pcm16ChunksToWavBase64(chunks: Buffer[], sampleRate = 16000): string {
+  const pcmData = Buffer.concat(chunks);
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * 2;
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmData.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcmData.length, 40);
+  return Buffer.concat([header, pcmData]).toString("base64");
 }
 
 interface TranslatedTurnResult {
@@ -112,40 +184,58 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
   }
   parts.push({ text: promptText });
 
-  const response = await ai.models.generateContent({
-    model: "gemini-4-hydrogen",
-    contents: { parts },
-    config: {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          sourceTranscript: {
-            type: Type.STRING,
-            description: "Accurate transcription of the spoken input in its original script.",
+  const callModel = async (modelName: string, thinkingLevel: ThinkingLevel) => {
+    return ai.models.generateContent({
+      model: modelName,
+      contents: { parts },
+      config: {
+        thinkingConfig: { thinkingLevel },
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            sourceTranscript: {
+              type: Type.STRING,
+              description: "Accurate transcription of the spoken input in its original script.",
+            },
+            detectedLanguage: {
+              type: Type.STRING,
+              description: "Name of the detected source language.",
+            },
+            resolvedSourceLang: {
+              type: Type.STRING,
+              description: "BCP-47 code of the detected input language.",
+            },
+            resolvedTargetLang: {
+              type: Type.STRING,
+              description: "BCP-47 code of the output translated language.",
+            },
+            translatedText: {
+              type: Type.STRING,
+              description: "Natural, faithful translation in the destination language.",
+            },
           },
-          detectedLanguage: {
-            type: Type.STRING,
-            description: "Name of the detected source language.",
-          },
-          resolvedSourceLang: {
-            type: Type.STRING,
-            description: "BCP-47 code of the detected input language.",
-          },
-          resolvedTargetLang: {
-            type: Type.STRING,
-            description: "BCP-47 code of the output translated language.",
-          },
-          translatedText: {
-            type: Type.STRING,
-            description: "Natural, faithful translation in the destination language.",
-          },
+          required: ["sourceTranscript", "detectedLanguage", "translatedText"],
         },
-        required: ["sourceTranscript", "detectedLanguage", "translatedText"],
       },
-    },
-  });
+    });
+  };
+
+  let response;
+  try {
+    response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
+  } catch (err) {
+    if (isTransientOverloadError(err)) {
+      await new Promise((r) => setTimeout(r, 450));
+      try {
+        response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
+      } catch {
+        response = await callModel("gemini-3.1-flash-lite", ThinkingLevel.MINIMAL);
+      }
+    } else {
+      throw err;
+    }
+  }
 
   const raw = (response.text ?? "{}").trim();
   const parsed = JSON.parse(raw) as Partial<TranslatedTurnResult>;
@@ -165,13 +255,29 @@ async function translateTextOnly(params: {
 }): Promise<string> {
   const ai = getAiClient();
   const targetLang = getLanguageByCode(params.targetLangCode);
-  const response = await ai.models.generateContent({
-    model: "gemini-4-hydrogen",
-    contents: `Translate this ${params.sourceLangName} text naturally and directly into ${targetLang.name} (${targetLang.nativeName}). Return ONLY the translated text with no extra commentary or quotation marks.\n\nText: ${params.text}`,
-    config: {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-    },
-  });
+  const prompt = `Translate this ${params.sourceLangName} text naturally and directly into ${targetLang.name} (${targetLang.nativeName}). Return ONLY the translated text with no extra commentary or quotation marks.\n\nText: ${params.text}`;
+  let response;
+  try {
+    response = await ai.models.generateContent({
+      model: "gemini-4-hydrogen",
+      contents: prompt,
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      },
+    });
+  } catch (err) {
+    if (isTransientOverloadError(err)) {
+      response = await ai.models.generateContent({
+        model: "gemini-3.1-flash-lite",
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+        },
+      });
+    } else {
+      throw err;
+    }
+  }
   return (response.text ?? "").trim();
 }
 
@@ -218,8 +324,19 @@ interface LiveTranslatorChannel {
   session: LiveSessionHandle | null;
   connecting: boolean;
   closed: boolean;
+  mode: "gemini_live" | "vad_stream";
+  resumeHandle?: string;
+  generation: number;
+  reconnectAttempts: number;
   inputBuf: string;
   outputBuf: string;
+  vadPreRoll: Buffer[];
+  vadChunks: Buffer[];
+  vadSpeechActive: boolean;
+  vadSpeechStartAt: number;
+  vadLastVoiceAt: number;
+  vadQueue: Buffer[][];
+  vadDraining: boolean;
 }
 
 interface RoomParticipant {
@@ -297,6 +414,137 @@ function closeParticipantTranslators(participant: RoomParticipant) {
   participant.liveTranslators.clear();
 }
 
+async function drainRoomChannelVadQueue(
+  room: RoomState,
+  speaker: RoomParticipant,
+  channel: LiveTranslatorChannel
+) {
+  if (channel.vadDraining || channel.closed) return;
+  channel.vadDraining = true;
+  try {
+    while (channel.vadQueue.length > 0 && !channel.closed) {
+      const utterance = channel.vadQueue.shift()!;
+      const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
+      try {
+        const result = await transcribeAndTranslate({
+          audioBase64: wavBase64,
+          mimeType: "audio/wav",
+          sourceLangCode: speaker.langCode,
+          targetLangCode: channel.targetLangCode,
+        });
+        if (channel.closed || !result.sourceTranscript || !result.translatedText) {
+          continue;
+        }
+        const wavOut = await synthesizeSpeechWav(result.translatedText, speaker.voiceName).catch(
+          () => null
+        );
+        const msgId = `live_${speaker.id}_${Date.now()}_${channel.targetLangCode}`;
+        const ts = Date.now();
+        room.messages.push({
+          id: msgId,
+          speakerId: speaker.id,
+          speakerName: speaker.name,
+          sourceLang: speaker.langCode,
+          sourceText: result.sourceTranscript,
+          translations: {
+            [speaker.langCode]: result.sourceTranscript,
+            [channel.targetLangCode]: result.translatedText,
+          },
+          timestamp: ts,
+        });
+        if (room.messages.length > 100) room.messages.shift();
+
+        for (const p of room.participants.values()) {
+          if (p.ws.readyState !== WebSocket.OPEN) continue;
+          if (p.id !== speaker.id && p.langCode === channel.targetLangCode && wavOut) {
+            p.ws.send(
+              JSON.stringify({
+                type: "room:live_audio_wav",
+                speakerId: speaker.id,
+                targetLang: channel.targetLangCode,
+                data: wavOut,
+              })
+            );
+          }
+          if (p.id === speaker.id || p.langCode === channel.targetLangCode) {
+            p.ws.send(
+              JSON.stringify({
+                type: "room:message",
+                message: {
+                  id: msgId,
+                  speakerId: speaker.id,
+                  speakerName: speaker.name,
+                  sourceLang: speaker.langCode,
+                  sourceText: result.sourceTranscript,
+                  targetLang: p.langCode,
+                  translatedText:
+                    p.langCode === channel.targetLangCode
+                      ? result.translatedText
+                      : result.sourceTranscript,
+                  audioWavBase64: null,
+                  liveStreamed: true,
+                  timestamp: ts,
+                },
+              })
+            );
+          }
+        }
+      } catch {
+        // Keep continuous stream alive across individual turn glitches
+      }
+    }
+  } finally {
+    channel.vadDraining = false;
+  }
+}
+
+function feedRoomChannelVadFrame(
+  room: RoomState,
+  speaker: RoomParticipant,
+  channel: LiveTranslatorChannel,
+  base64Pcm: string
+) {
+  const pcmBuf = Buffer.from(base64Pcm, "base64");
+  if (pcmBuf.length < 4) return;
+  const rms = computePcm16Rms(pcmBuf);
+  const now = Date.now();
+  const SPEECH_THRESHOLD = 0.014;
+  const SILENCE_HANG_MS = 750;
+  const MAX_UTTERANCE_MS = 10000;
+  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.4; // 400ms
+
+  if (!channel.vadSpeechActive) {
+    channel.vadPreRoll.push(pcmBuf);
+    if (channel.vadPreRoll.length > 2) channel.vadPreRoll.shift();
+    if (rms >= SPEECH_THRESHOLD) {
+      channel.vadSpeechActive = true;
+      channel.vadSpeechStartAt = now;
+      channel.vadLastVoiceAt = now;
+      channel.vadChunks = [...channel.vadPreRoll, pcmBuf];
+      channel.vadPreRoll = [];
+    }
+    return;
+  }
+
+  channel.vadChunks.push(pcmBuf);
+  if (rms >= SPEECH_THRESHOLD) {
+    channel.vadLastVoiceAt = now;
+  }
+
+  const silenceElapsed = now - channel.vadLastVoiceAt;
+  const speechElapsed = now - channel.vadSpeechStartAt;
+  if (silenceElapsed >= SILENCE_HANG_MS || speechElapsed >= MAX_UTTERANCE_MS) {
+    const totalBytes = channel.vadChunks.reduce((acc, b) => acc + b.length, 0);
+    const utterance = channel.vadChunks;
+    channel.vadChunks = [];
+    channel.vadSpeechActive = false;
+    if (totalBytes >= MIN_UTTERANCE_BYTES) {
+      channel.vadQueue.push(utterance);
+      void drainRoomChannelVadQueue(room, speaker, channel);
+    }
+  }
+}
+
 async function openRoomTranslatorChannel(
   room: RoomState,
   speaker: RoomParticipant,
@@ -309,10 +557,15 @@ async function openRoomTranslatorChannel(
   const sourceLang = getLanguageByCode(speaker.langCode);
   let usedFallback = false;
 
-  const connectWithModel = async (useTranslateModel: boolean): Promise<LiveSessionHandle> => {
+  const connectWithModel = async (
+    useTranslateModel: boolean,
+    withCompression: boolean
+  ): Promise<LiveSessionHandle> => {
     const ai = getAiClient();
     const model = useTranslateModel ? "gemini-3.5-live-translate-preview" : "gemini-3.8-live";
-    const config = useTranslateModel
+    const gen = ++channel.generation;
+
+    const baseConfig = useTranslateModel
       ? {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
@@ -332,17 +585,31 @@ async function openRoomTranslatorChannel(
           systemInstruction: `You are a simultaneous voice interpreter on a live phone call. Listen to ${speaker.name} speaking ${sourceLang.name} (${sourceLang.nativeName}) and immediately speak ONLY the natural, accurate translation in ${targetLang.name} (${targetLang.nativeName}). Never reply to the speaker or add commentary.`,
         };
 
+    const config = withCompression
+      ? {
+          ...baseConfig,
+          contextWindowCompression: { slidingWindow: {} },
+          sessionResumption: channel.resumeHandle ? { handle: channel.resumeHandle } : {},
+        }
+      : baseConfig;
+
     return ai.live.connect({
       model,
       config,
       callbacks: {
         onmessage: (message: LiveServerMessage) => {
-          if (channel.closed) return;
+          if (channel.closed || gen !== channel.generation) return;
+          if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate?.newHandle) {
+            channel.resumeHandle = message.sessionResumptionUpdate.newHandle;
+          }
+          if (message.goAway) {
+            void reconnectRoomChannel(useTranslateModel);
+            return;
+          }
           const content = message.serverContent;
 
           if (content?.inputTranscription?.text) {
             channel.inputBuf += content.inputTranscription.text;
-            // Send live source caption back to speaker and target listeners
             const capPayload = JSON.stringify({
               type: "room:live_caption",
               speakerId: speaker.id,
@@ -472,49 +739,63 @@ async function openRoomTranslatorChannel(
             }
           }
         },
-        onerror: async () => {
-          if (channel.closed) return;
-          if (useTranslateModel && !usedFallback) {
-            usedFallback = true;
-            try {
-              channel.session = await connectWithModel(false);
-            } catch {
-              // ignore
-            }
-          }
+        onerror: () => {
+          // handled via onclose / catch
         },
-        onclose: async (event: unknown) => {
-          if (channel.closed) return;
-          const reason =
-            typeof event === "object" && event && "reason" in event
-              ? String((event as { reason?: string }).reason || "")
-              : "";
-          if (useTranslateModel && !usedFallback && reason.toLowerCase().includes("language")) {
-            usedFallback = true;
-            try {
-              channel.session = await connectWithModel(false);
-            } catch {
-              // ignore
-            }
-          }
+        onclose: () => {
+          if (channel.closed || gen !== channel.generation) return;
+          void reconnectRoomChannel(useTranslateModel);
         },
       },
     });
   };
 
+  const reconnectRoomChannel = async (useTranslateModel: boolean) => {
+    if (channel.closed || channel.mode === "vad_stream") return;
+    if (channel.reconnectAttempts >= 3) {
+      channel.mode = "vad_stream";
+      channel.session = null;
+      return;
+    }
+    channel.reconnectAttempts += 1;
+    try {
+      channel.session?.close();
+    } catch {
+      // ignore
+    }
+    try {
+      channel.session = await connectWithModel(useTranslateModel, true);
+      channel.reconnectAttempts = 0;
+    } catch {
+      if (useTranslateModel && !usedFallback) {
+        usedFallback = true;
+        try {
+          channel.session = await connectWithModel(false, false);
+          channel.reconnectAttempts = 0;
+          return;
+        } catch {
+          // switch to continuous VAD stream
+        }
+      }
+      channel.mode = "vad_stream";
+      channel.session = null;
+    }
+  };
+
   try {
-    channel.session = await connectWithModel(targetLang.liveTranslateSupported);
+    channel.session = await connectWithModel(targetLang.liveTranslateSupported, true);
   } catch {
     if (targetLang.liveTranslateSupported && !usedFallback) {
       usedFallback = true;
       try {
-        channel.session = await connectWithModel(false);
-      } catch (err) {
-        const formatted = formatApiError(err);
-        if (speaker.ws.readyState === WebSocket.OPEN) {
-          speaker.ws.send(JSON.stringify({ type: "error", message: formatted.message }));
-        }
+        channel.session = await connectWithModel(false, false);
+      } catch {
+        channel.mode = "vad_stream";
+        channel.session = null;
       }
+    } else {
+      channel.mode = "vad_stream";
+      channel.session = null;
     }
   } finally {
     channel.connecting = false;
@@ -555,8 +836,18 @@ function reconcileParticipantTranslators(room: RoomState, speaker: RoomParticipa
         session: null,
         connecting: true,
         closed: false,
+        mode: "gemini_live",
+        generation: 0,
+        reconnectAttempts: 0,
         inputBuf: "",
         outputBuf: "",
+        vadPreRoll: [],
+        vadChunks: [],
+        vadSpeechActive: false,
+        vadSpeechStartAt: 0,
+        vadLastVoiceAt: 0,
+        vadQueue: [],
+        vadDraining: false,
       };
       speaker.liveTranslators.set(targetLang, ch);
       void openRoomTranslatorChannel(room, speaker, targetLang);
@@ -693,6 +984,8 @@ async function startServer() {
 
   // --------------------------------------------------------------------------
   // Live Continuous Speech-to-Speech Translation WebSocket (/ws/live)
+  // Unlimited session duration via Context Compression, Session Resumption,
+  // automatic reconnection, and seamless Continuous VAD Fallback.
   // --------------------------------------------------------------------------
   liveWss.on("connection", async (clientWs, req) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -707,19 +1000,186 @@ async function startServer() {
       bidirectionalParam && sourceLang !== null && sourceLang.code !== targetLang.code;
     const sourceLangLabel = sourceLang ? sourceLang.name : "any spoken language";
 
-    let activeSession: Awaited<ReturnType<GoogleGenAI["live"]["connect"]>> | null = null;
+    let activeSession: LiveSessionHandle | null = null;
     let isClosed = false;
-    let usedFallback = false;
+    let mode: "gemini_live" | "vad_stream" = "gemini_live";
+    let usedFallbackModel = false;
+    let resumeHandle: string | undefined;
+    let sessionGeneration = 0;
+    let reconnectAttempts = 0;
+    let statusSent = false;
 
-    const connectLiveSession = async (useTranslateModel: boolean) => {
+    // Continuous VAD state (unlimited fallback when BidiGenerateContent is unavailable/exhausted)
+    let vadPreRoll: Buffer[] = [];
+    let vadChunks: Buffer[] = [];
+    let vadSpeechActive = false;
+    let vadSpeechStartAt = 0;
+    let vadLastVoiceAt = 0;
+    const vadQueue: Buffer[][] = [];
+    let vadDraining = false;
+
+    const sendConnectedStatus = (activeMode: string) => {
+      if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
+      statusSent = true;
+      clientWs.send(
+        JSON.stringify({
+          type: "status",
+          connected: true,
+          mode: activeMode,
+          targetLang: targetLang.code,
+        })
+      );
+    };
+
+    const drainVadQueue = async () => {
+      if (vadDraining || isClosed) return;
+      vadDraining = true;
+      try {
+        while (vadQueue.length > 0 && !isClosed && clientWs.readyState === WebSocket.OPEN) {
+          const utterance = vadQueue.shift()!;
+          const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
+          try {
+            const result = await transcribeAndTranslate({
+              audioBase64: wavBase64,
+              mimeType: "audio/wav",
+              sourceLangCode: sourceCode,
+              targetLangCode: targetLang.code,
+              bidirectional: isBidirectional,
+            });
+            if (isClosed || clientWs.readyState !== WebSocket.OPEN) break;
+            if (!result.sourceTranscript && !result.translatedText) continue;
+
+            if (result.sourceTranscript) {
+              clientWs.send(
+                JSON.stringify({ type: "inputTranscript", text: result.sourceTranscript })
+              );
+            }
+            if (result.translatedText) {
+              clientWs.send(
+                JSON.stringify({ type: "outputTranscript", text: result.translatedText })
+              );
+              const wavOut = await synthesizeSpeechWav(result.translatedText, voiceName).catch(
+                () => null
+              );
+              if (wavOut && !isClosed && clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({ type: "audioWav", data: wavOut }));
+              }
+            }
+            if (!isClosed && clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: "turnComplete" }));
+            }
+          } catch (err) {
+            const formatted = formatApiError(err);
+            if (formatted.status === 403 && clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: "error", message: formatted.message }));
+              clientWs.close();
+              return;
+            }
+          }
+        }
+      } finally {
+        vadDraining = false;
+      }
+    };
+
+    const feedVadFrame = (base64Pcm: string) => {
+      const pcmBuf = Buffer.from(base64Pcm, "base64");
+      if (pcmBuf.length < 4) return;
+      const rms = computePcm16Rms(pcmBuf);
+      const now = Date.now();
+      const SPEECH_THRESHOLD = 0.014;
+      const SILENCE_HANG_MS = 750;
+      const MAX_UTTERANCE_MS = 10000;
+      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.4; // 400ms
+
+      if (!vadSpeechActive) {
+        vadPreRoll.push(pcmBuf);
+        if (vadPreRoll.length > 2) vadPreRoll.shift();
+        if (rms >= SPEECH_THRESHOLD) {
+          vadSpeechActive = true;
+          vadSpeechStartAt = now;
+          vadLastVoiceAt = now;
+          vadChunks = [...vadPreRoll, pcmBuf];
+          vadPreRoll = [];
+        }
+        return;
+      }
+
+      vadChunks.push(pcmBuf);
+      if (rms >= SPEECH_THRESHOLD) {
+        vadLastVoiceAt = now;
+      }
+
+      const silenceElapsed = now - vadLastVoiceAt;
+      const speechElapsed = now - vadSpeechStartAt;
+      if (silenceElapsed >= SILENCE_HANG_MS || speechElapsed >= MAX_UTTERANCE_MS) {
+        const totalBytes = vadChunks.reduce((acc, b) => acc + b.length, 0);
+        const utterance = vadChunks;
+        vadChunks = [];
+        vadSpeechActive = false;
+        if (totalBytes >= MIN_UTTERANCE_BYTES) {
+          vadQueue.push(utterance);
+          void drainVadQueue();
+        }
+      }
+    };
+
+    const activateContinuousVadFallback = () => {
+      if (isClosed) return;
+      mode = "vad_stream";
+      try {
+        activeSession?.close();
+      } catch {
+        // ignore
+      }
+      activeSession = null;
+      sendConnectedStatus("continuous-vad");
+    };
+
+    // Register client message & close listeners immediately to prevent missing early frames
+    clientWs.on("message", (raw) => {
+      if (isClosed) return;
+      try {
+        const parsed = JSON.parse(raw.toString()) as { type?: string; data?: string };
+        if (parsed.type === "audio" && typeof parsed.data === "string" && parsed.data.length > 0) {
+          if (mode === "vad_stream") {
+            feedVadFrame(parsed.data);
+          } else if (activeSession) {
+            activeSession.sendRealtimeInput({
+              audio: { data: parsed.data, mimeType: "audio/pcm;rate=16000" },
+            });
+          }
+        }
+      } catch {
+        // Ignore malformed frames
+      }
+    });
+
+    clientWs.on("close", () => {
+      isClosed = true;
+      sessionGeneration += 1;
+      try {
+        activeSession?.close();
+      } catch {
+        // ignore
+      }
+      activeSession = null;
+    });
+
+    const connectLiveSession = async (
+      useTranslateModel: boolean,
+      withCompression: boolean
+    ): Promise<LiveSessionHandle> => {
       const ai = getAiClient();
       const model = useTranslateModel ? "gemini-3.5-live-translate-preview" : "gemini-3.8-live";
+      const gen = ++sessionGeneration;
 
-      const systemInstruction = isBidirectional && sourceLang
-        ? `You are a seamless two-way simultaneous voice interpreter between ${sourceLang.name} (${sourceLang.nativeName}) and ${targetLang.name} (${targetLang.nativeName}). Listen to each spoken phrase: if it is in ${sourceLang.name}, immediately speak ONLY the natural translation in ${targetLang.name}. If it is in ${targetLang.name}, immediately speak ONLY the natural translation in ${sourceLang.name}. Never reply to the content or add commentary.`
-        : `You are a simultaneous voice interpreter. Listen to the speaker (${sourceLangLabel}) and immediately translate everything they say aloud into ${targetLang.name} (${targetLang.nativeName}). Speak ONLY the direct translation naturally—do not answer questions, do not explain, and do not add commentary.`;
+      const systemInstruction =
+        isBidirectional && sourceLang
+          ? `You are a seamless two-way simultaneous voice interpreter between ${sourceLang.name} (${sourceLang.nativeName}) and ${targetLang.name} (${targetLang.nativeName}). Listen to each spoken phrase: if it is in ${sourceLang.name}, immediately speak ONLY the natural translation in ${targetLang.name}. If it is in ${targetLang.name}, immediately speak ONLY the natural translation in ${sourceLang.name}. Never reply to the content or add commentary.`
+          : `You are a simultaneous voice interpreter. Listen to the speaker (${sourceLangLabel}) and immediately translate everything they say aloud into ${targetLang.name} (${targetLang.nativeName}). Speak ONLY the direct translation naturally—do not answer questions, do not explain, and do not add commentary.`;
 
-      const config = useTranslateModel
+      const baseConfig = useTranslateModel
         ? {
             responseModalities: [Modality.AUDIO],
             inputAudioTranscription: {},
@@ -739,24 +1199,37 @@ async function startServer() {
             systemInstruction,
           };
 
+      const config = withCompression
+        ? {
+            ...baseConfig,
+            contextWindowCompression: { slidingWindow: {} },
+            sessionResumption: resumeHandle ? { handle: resumeHandle } : {},
+          }
+        : baseConfig;
+
       const session = await ai.live.connect({
         model,
         config,
         callbacks: {
           onopen: () => {
-            if (!isClosed && clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(
-                JSON.stringify({
-                  type: "status",
-                  connected: true,
-                  model,
-                  targetLang: targetLang.code,
-                })
-              );
+            if (!isClosed && gen === sessionGeneration) {
+              sendConnectedStatus(model);
             }
           },
           onmessage: (message: LiveServerMessage) => {
-            if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
+            if (isClosed || gen !== sessionGeneration || clientWs.readyState !== WebSocket.OPEN) {
+              return;
+            }
+            if (
+              message.sessionResumptionUpdate?.resumable &&
+              message.sessionResumptionUpdate?.newHandle
+            ) {
+              resumeHandle = message.sessionResumptionUpdate.newHandle;
+            }
+            if (message.goAway) {
+              void reconnectLiveSession(useTranslateModel);
+              return;
+            }
             const content = message.serverContent;
             if (content?.inputTranscription?.text) {
               clientWs.send(
@@ -791,48 +1264,20 @@ async function startServer() {
               clientWs.send(JSON.stringify({ type: "turnComplete" }));
             }
           },
-          onerror: async (err: unknown) => {
-            if (isClosed) return;
-            if (useTranslateModel && !usedFallback) {
-              usedFallback = true;
-              try {
-                activeSession = await connectLiveSession(false);
-                return;
-              } catch (fallbackErr) {
-                const formatted = formatApiError(fallbackErr);
-                if (clientWs.readyState === WebSocket.OPEN) {
-                  clientWs.send(JSON.stringify({ type: "error", message: formatted.message }));
-                }
-              }
-            } else {
+          onerror: (err: unknown) => {
+            if (isClosed || gen !== sessionGeneration) return;
+            const msg = extractErrorMessage(err);
+            if (isFatalAuthError(msg)) {
               const formatted = formatApiError(err);
               if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(JSON.stringify({ type: "error", message: formatted.message }));
+                clientWs.close();
               }
             }
           },
-          onclose: async (event: unknown) => {
-            if (isClosed) return;
-            const reason =
-              typeof event === "object" && event && "reason" in event
-                ? String((event as { reason?: string }).reason || "")
-                : "";
-            if (
-              useTranslateModel &&
-              !usedFallback &&
-              reason.toLowerCase().includes("language")
-            ) {
-              usedFallback = true;
-              try {
-                activeSession = await connectLiveSession(false);
-                return;
-              } catch {
-                // fall through to notify client
-              }
-            }
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: "status", connected: false, reason }));
-            }
+          onclose: async () => {
+            if (isClosed || gen !== sessionGeneration) return;
+            await reconnectLiveSession(useTranslateModel);
           },
         },
       });
@@ -840,23 +1285,53 @@ async function startServer() {
       return session;
     };
 
-    const useTranslateInitially = !isBidirectional && targetLang.liveTranslateSupported;
-    try {
-      activeSession = await connectLiveSession(useTranslateInitially);
-    } catch (err) {
-      if (useTranslateInitially && !usedFallback) {
-        usedFallback = true;
-        try {
-          activeSession = await connectLiveSession(false);
-        } catch (fallbackErr) {
-          const formatted = formatApiError(fallbackErr);
+    const reconnectLiveSession = async (useTranslateModel: boolean) => {
+      if (isClosed || mode === "vad_stream") return;
+      if (reconnectAttempts >= 4) {
+        activateContinuousVadFallback();
+        return;
+      }
+      reconnectAttempts += 1;
+      try {
+        activeSession?.close();
+      } catch {
+        // ignore
+      }
+      try {
+        activeSession = await connectLiveSession(useTranslateModel, true);
+        reconnectAttempts = 0;
+        if (!statusSent) sendConnectedStatus("gemini-live");
+      } catch (err) {
+        const msg = extractErrorMessage(err);
+        if (isFatalAuthError(msg)) {
+          const formatted = formatApiError(err);
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: "error", message: formatted.message }));
             clientWs.close();
           }
           return;
         }
-      } else {
+        if (useTranslateModel && !usedFallbackModel) {
+          usedFallbackModel = true;
+          try {
+            activeSession = await connectLiveSession(false, false);
+            reconnectAttempts = 0;
+            if (!statusSent) sendConnectedStatus("gemini-3.8-live");
+            return;
+          } catch {
+            // Fall through to Continuous VAD fallback
+          }
+        }
+        activateContinuousVadFallback();
+      }
+    };
+
+    const useTranslateInitially = !isBidirectional && targetLang.liveTranslateSupported;
+    try {
+      activeSession = await connectLiveSession(useTranslateInitially, true);
+    } catch (err) {
+      const msg = extractErrorMessage(err);
+      if (isFatalAuthError(msg)) {
         const formatted = formatApiError(err);
         if (clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(JSON.stringify({ type: "error", message: formatted.message }));
@@ -864,30 +1339,22 @@ async function startServer() {
         }
         return;
       }
-    }
-
-    clientWs.on("message", (raw) => {
-      if (isClosed || !activeSession) return;
-      try {
-        const parsed = JSON.parse(raw.toString()) as { type?: string; data?: string };
-        if (parsed.type === "audio" && typeof parsed.data === "string" && parsed.data.length > 0) {
-          activeSession.sendRealtimeInput({
-            audio: { data: parsed.data, mimeType: "audio/pcm;rate=16000" },
-          });
+      if (useTranslateInitially && !usedFallbackModel) {
+        usedFallbackModel = true;
+        try {
+          activeSession = await connectLiveSession(false, true);
+        } catch {
+          activateContinuousVadFallback();
         }
-      } catch {
-        // Ignore malformed frames
+      } else {
+        // Try without compression/resumption once, else activate unlimited VAD fallback
+        try {
+          activeSession = await connectLiveSession(false, false);
+        } catch {
+          activateContinuousVadFallback();
+        }
       }
-    });
-
-    clientWs.on("close", () => {
-      isClosed = true;
-      try {
-        activeSession?.close();
-      } catch {
-        // ignore
-      }
-    });
+    }
   });
 
   // --------------------------------------------------------------------------
@@ -1017,7 +1484,10 @@ async function startServer() {
             msg.data.length > 0
           ) {
             for (const ch of current.liveTranslators.values()) {
-              if (!ch.closed && ch.session) {
+              if (ch.closed) continue;
+              if (ch.mode === "vad_stream") {
+                feedRoomChannelVadFrame(room!, current, ch, msg.data);
+              } else if (ch.session) {
                 ch.session.sendRealtimeInput({
                   audio: { data: msg.data, mimeType: "audio/pcm;rate=16000" },
                 });

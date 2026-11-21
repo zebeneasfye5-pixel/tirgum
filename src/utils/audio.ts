@@ -52,6 +52,19 @@ export function base64Pcm16ToFloat32(base64: string): Float32Array {
   return float32;
 }
 
+export async function createInputAudioContext(): Promise<AudioContext> {
+  let ctx: AudioContext;
+  try {
+    ctx = new AudioContext({ sampleRate: 16000 });
+  } catch {
+    ctx = new AudioContext();
+  }
+  if (ctx.state === "suspended") {
+    await ctx.resume();
+  }
+  return ctx;
+}
+
 export class GaplessPcmPlayer {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
@@ -62,7 +75,11 @@ export class GaplessPcmPlayer {
 
   public ensureContext(): { ctx: AudioContext; analyser: AnalyserNode } {
     if (!this.ctx) {
-      this.ctx = new AudioContext({ sampleRate: 24000 });
+      try {
+        this.ctx = new AudioContext({ sampleRate: 24000 });
+      } catch {
+        this.ctx = new AudioContext();
+      }
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 256;
       this.gainNode = this.ctx.createGain();
@@ -111,6 +128,40 @@ export class GaplessPcmPlayer {
     source.onended = () => {
       this.activeSources.delete(source);
     };
+  }
+
+  public async enqueueWavBase64(base64Wav: string) {
+    try {
+      const { ctx, analyser } = this.ensureContext();
+      const binary = atob(base64Wav);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const decoded = await ctx.decodeAudioData(bytes.buffer.slice(0));
+      if (!this.ctx || !this.analyser) return;
+
+      const source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(analyser);
+
+      const now = ctx.currentTime;
+      if (this.nextStartTime < now + 0.02) {
+        this.nextStartTime = now + 0.03;
+      }
+
+      source.start(this.nextStartTime);
+      this.nextStartTime += decoded.duration;
+
+      this.activeSources.add(source);
+      source.onended = () => {
+        this.activeSources.delete(source);
+      };
+    } catch {
+      if (!this.muted) {
+        await playWavBase64(base64Wav);
+      }
+    }
   }
 
   public interrupt() {
