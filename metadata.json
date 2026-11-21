@@ -1,0 +1,6 @@
+{
+  "name": "Lissan — Live Voice Translation Studio",
+  "description": "Real-time voice-to-voice translation studio connecting speakers across world languages with live speech synthesis and multi-device rooms.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
