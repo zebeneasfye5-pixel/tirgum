@@ -94,16 +94,16 @@ export async function createBoostedMicPipeline(
   const preGain = ctx.createGain();
   const compressor = ctx.createDynamicsCompressor();
   compressor.knee.value = 18;
-  compressor.attack.value = 0.003;
-  compressor.release.value = 0.14;
+  compressor.attack.value = 0.008;
+  compressor.release.value = 0.18;
   const makeupGain = ctx.createGain();
 
   const applyBoost = (enabled: boolean) => {
     const now = ctx.currentTime;
-    preGain.gain.setTargetAtTime(enabled ? 3.8 : 1.35, now, 0.03);
-    compressor.threshold.setTargetAtTime(enabled ? -38 : -22, now, 0.03);
-    compressor.ratio.setTargetAtTime(enabled ? 8 : 3, now, 0.03);
-    makeupGain.gain.setTargetAtTime(enabled ? 1.65 : 1.05, now, 0.03);
+    preGain.gain.setTargetAtTime(enabled ? 2.1 : 1.0, now, 0.03);
+    compressor.threshold.setTargetAtTime(enabled ? -32 : -6, now, 0.03);
+    compressor.ratio.setTargetAtTime(enabled ? 4 : 1.5, now, 0.03);
+    makeupGain.gain.setTargetAtTime(enabled ? 1.25 : 1.0, now, 0.03);
   };
   applyBoost(boostEnabled);
 
@@ -185,6 +185,37 @@ export class GaplessPcmPlayer {
     if (this.gainNode) {
       this.gainNode.gain.value = muted ? 0 : 1.25;
     }
+  }
+
+  public enqueuePcm24kBytes(bytes: Uint8Array) {
+    const sampleCount = Math.floor(bytes.byteLength / 2);
+    if (sampleCount === 0) return;
+    const { ctx, analyser } = this.ensureContext();
+    const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
+    const samples = new Float32Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      samples[i] = view.getInt16(i * 2, true) / 32768;
+    }
+
+    const buffer = ctx.createBuffer(1, samples.length, 24000);
+    buffer.getChannelData(0).set(samples);
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(analyser);
+
+    const now = ctx.currentTime;
+    if (this.nextStartTime < now + 0.015) {
+      this.nextStartTime = now + 0.025;
+    }
+
+    source.start(this.nextStartTime);
+    this.nextStartTime += buffer.duration;
+
+    this.activeSources.add(source);
+    source.onended = () => {
+      this.activeSources.delete(source);
+    };
   }
 
   public enqueuePcm24kBase64(base64: string) {

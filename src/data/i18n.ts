@@ -85,6 +85,8 @@ export const UI_COPY = {
     shareInvite: 'ሊንክ አጋራ',
     whisperBoostLabel: 'የርቀትና ሹክሹክታ ማጉያ',
     highTrafficWait: 'መጠነኛ መጨናነቅ አለ — በሰከንዶች ውስጥ በራሱ ይቀጥላል...',
+    deleteItem: 'አጥፋ',
+    clearScreenText: 'ጽሑፍ አጽዳ',
   },
   en: {
     brand: 'Lissan',
@@ -170,5 +172,7 @@ export const UI_COPY = {
     shareInvite: 'Share Invite',
     whisperBoostLabel: 'Whisper & Far-Mic Boost',
     highTrafficWait: 'High traffic — resuming automatically...',
+    deleteItem: 'Delete',
+    clearScreenText: 'Clear text',
   },
 } as const;

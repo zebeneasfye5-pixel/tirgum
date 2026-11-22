@@ -132,6 +132,7 @@ export default function App() {
   const inputStreamRef = useRef<MediaStream | null>(null);
   const micPipelineRef = useRef<BoostedMicPipeline | null>(null);
   const playerRef = useRef<GaplessPcmPlayer | null>(null);
+  const turnPlayerRef = useRef<GaplessPcmPlayer | null>(null);
   const liveInputAccRef = useRef<string>("");
   const liveOutputAccRef = useRef<string>("");
   const autoPlayRef = useRef<boolean>(autoPlay);
@@ -260,6 +261,10 @@ export default function App() {
   useEffect(() => {
     return () => {
       stopLiveSession();
+      if (turnPlayerRef.current) {
+        turnPlayerRef.current.close();
+        turnPlayerRef.current = null;
+      }
     };
   }, [stopLiveSession]);
 
@@ -429,20 +434,82 @@ export default function App() {
     }
   }, [openLiveSocket, stopLiveSession, t.errorMicDenied]);
 
+  const streamTtsAudio = useCallback(
+    async (text: string, langCode: string) => {
+      const cleaned = text.trim();
+      if (!cleaned) return;
+      if (!turnPlayerRef.current) {
+        turnPlayerRef.current = new GaplessPcmPlayer();
+      }
+      const player = turnPlayerRef.current;
+      player.setMuted(!autoPlayRef.current);
+      player.interrupt();
+      const { analyser } = player.ensureContext();
+      setOutputAnalyser(analyser);
+
+      try {
+        const res = await fetch("/api/tts-stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: cleaned, voiceName }),
+        });
+        if (!res.ok || res.status === 204 || !res.body) {
+          if (autoPlayRef.current) {
+            speakBrowserFallback(cleaned, langCode);
+          }
+          return;
+        }
+        const reader = res.body.getReader();
+        let leftover: number | null = null;
+        let receivedAny = false;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || value.byteLength === 0) continue;
+
+          let bytes = value;
+          if (leftover !== null) {
+            const merged = new Uint8Array(value.byteLength + 1);
+            merged[0] = leftover;
+            merged.set(value, 1);
+            bytes = merged;
+            leftover = null;
+          }
+          if (bytes.byteLength % 2 === 1) {
+            leftover = bytes[bytes.byteLength - 1];
+            bytes = bytes.subarray(0, bytes.byteLength - 1);
+          }
+          if (bytes.byteLength >= 2) {
+            receivedAny = true;
+            player.enqueuePcm24kBytes(bytes);
+          }
+        }
+        if (!receivedAny && autoPlayRef.current) {
+          speakBrowserFallback(cleaned, langCode);
+        }
+      } catch {
+        if (autoPlayRef.current) {
+          speakBrowserFallback(cleaned, langCode);
+        }
+      }
+    },
+    [voiceName]
+  );
+
   const executeTurnTranslation = useCallback(
     async (payload: { audioBase64?: string; mimeType?: string; text?: string }) => {
       setTurnProcessing(true);
       setErrorBanner(null);
       setNoticeBanner(null);
       try {
-        const res = await fetch("/api/translate-turn", {
+        const res = await fetch("/api/translate-fast", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...payload,
             sourceLang,
             targetLang,
-            voiceName,
             bidirectional: bidirectional && sourceLang !== "auto",
           }),
         });
@@ -458,7 +525,7 @@ export default function App() {
         if (data.sourceTranscript || data.translatedText) {
           setLiveInputText(data.sourceTranscript || "");
           setLiveOutputText(data.translatedText || "");
-          setLastTurnAudio(data.audioWavBase64 || null);
+          setLastTurnAudio(null);
 
           const resolvedSrc =
             data.resolvedSourceLang ||
@@ -472,16 +539,15 @@ export default function App() {
               targetLang: resolvedTgt,
               sourceText: data.sourceTranscript || "",
               translatedText: data.translatedText || "",
-              audioWavBase64: data.audioWavBase64 || null,
+              audioWavBase64: null,
               timestamp: Date.now(),
             },
             ...prev,
           ]);
 
-          if (autoPlay && data.audioWavBase64) {
-            void playWavBase64(data.audioWavBase64);
-          } else if (autoPlay && data.translatedText) {
-            speakBrowserFallback(data.translatedText, resolvedTgt);
+          setTurnProcessing(false);
+          if (autoPlay && data.translatedText) {
+            void streamTtsAudio(data.translatedText, resolvedTgt);
           }
         }
       } catch (err) {
@@ -490,7 +556,7 @@ export default function App() {
         setTurnProcessing(false);
       }
     },
-    [autoPlay, bidirectional, sourceLang, targetLang, voiceName, t.errorGeneric, t.highTrafficWait]
+    [autoPlay, bidirectional, sourceLang, streamTtsAudio, targetLang, t.errorGeneric, t.highTrafficWait]
   );
 
   const startTurnRecording = async () => {
@@ -967,9 +1033,26 @@ export default function App() {
                 <div className="flex flex-col justify-between rounded-xl border border-slate-300 bg-white p-6">
                   <div className="space-y-4">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-sm font-extrabold uppercase tracking-wider text-slate-800">
-                        {t.speakerLabel}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-extrabold uppercase tracking-wider text-slate-800">
+                          {t.speakerLabel}
+                        </span>
+                        {liveInputText && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              liveInputAccRef.current = "";
+                              setLiveInputText("");
+                            }}
+                            title={t.clearScreenText}
+                            aria-label={t.clearScreenText}
+                            className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-300 bg-white px-2 text-xs font-bold text-slate-700 hover:border-red-300 hover:bg-red-50 hover:text-red-700"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            <span>{t.deleteItem}</span>
+                          </button>
+                        )}
+                      </div>
                       <button
                         type="button"
                         onClick={() => setPickerTarget("source")}
@@ -1151,11 +1234,15 @@ export default function App() {
                       <span className="font-mono uppercase">{targetLangObj.code}</span>
                     </div>
 
-                    <div className="flex items-center gap-2">
-                      {lastTurnAudio && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      {liveOutputText && (
                         <button
                           type="button"
-                          onClick={() => void playWavBase64(lastTurnAudio)}
+                          onClick={() =>
+                            lastTurnAudio
+                              ? void playWavBase64(lastTurnAudio)
+                              : void streamTtsAudio(liveOutputText, targetLang)
+                          }
                           className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 text-sm font-bold text-slate-900 transition-colors hover:bg-slate-50 whitespace-nowrap"
                         >
                           <Volume2 className="h-4 w-4 text-blue-700" />
@@ -1174,6 +1261,22 @@ export default function App() {
                             <Copy className="h-4 w-4" />
                           )}
                           <span>{copiedId === "current" ? t.copied : t.copyText}</span>
+                        </button>
+                      )}
+                      {liveOutputText && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            liveOutputAccRef.current = "";
+                            setLiveOutputText("");
+                            setLastTurnAudio(null);
+                          }}
+                          title={t.clearScreenText}
+                          aria-label={t.clearScreenText}
+                          className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 text-sm font-bold text-slate-700 transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-700 whitespace-nowrap"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          <span>{t.deleteItem}</span>
                         </button>
                       )}
                     </div>
@@ -1282,11 +1385,15 @@ export default function App() {
                         <p className="text-base font-semibold text-slate-700">{item.sourceText}</p>
                       )}
                     </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {item.audioWavBase64 && (
+                    <div className="flex shrink-0 flex-wrap items-center gap-2">
+                      {item.translatedText && (
                         <button
                           type="button"
-                          onClick={() => void playWavBase64(item.audioWavBase64!)}
+                          onClick={() =>
+                            item.audioWavBase64
+                              ? void playWavBase64(item.audioWavBase64)
+                              : void streamTtsAudio(item.translatedText, item.targetLang)
+                          }
                           className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-3.5 text-sm font-bold text-slate-900 hover:bg-slate-100 whitespace-nowrap"
                         >
                           <Volume2 className="h-4 w-4 text-blue-700" />
@@ -1304,6 +1411,18 @@ export default function App() {
                           <Copy className="h-4 w-4" />
                         )}
                         <span>{copiedId === item.id ? t.copied : t.copyText}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setHistory((prev) => prev.filter((entry) => entry.id !== item.id))
+                        }
+                        title={t.deleteItem}
+                        aria-label={t.deleteItem}
+                        className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 text-sm font-bold text-slate-700 transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-700 whitespace-nowrap"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        <span>{t.deleteItem}</span>
                       </button>
                     </div>
                   </div>

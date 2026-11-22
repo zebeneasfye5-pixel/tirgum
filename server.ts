@@ -134,12 +134,13 @@ function normalizePcm16Buffer(pcmBuffer: Buffer): Buffer {
     if (abs > peak) peak = abs;
   }
 
-  // Boost quiet/whispered/far-mic captures up toward 22,000 peak without amplifying pure noise floor
-  if (peak < 55 || peak >= 14000) {
+  // Only normalize genuinely quiet/whispered captures (< 7,500 peak) with gentle max 4.5x gain
+  // so normal Amharic ejectives & consonants never clip or distort.
+  if (peak < 90 || peak >= 7500) {
     return pcmBuffer;
   }
 
-  const gain = Math.min(12, 22000 / peak);
+  const gain = Math.min(4.5, 17500 / peak);
   const out = Buffer.allocUnsafe(pcmBuffer.length);
   for (let i = 0; i < sampleCount; i++) {
     const boosted = Math.round(pcmBuffer.readInt16LE(i * 2) * gain);
@@ -192,6 +193,11 @@ async function transcribeAndTranslate(params: {
     params.sourceLangCode === "auto" ? null : getLanguageByCode(params.sourceLangCode);
   const isBidirectional =
     Boolean(params.bidirectional) && sourceLang !== null && sourceLang.code !== targetLang.code;
+  const involvesEthiopic =
+    params.sourceLangCode === "am" ||
+    params.targetLangCode === "am" ||
+    params.sourceLangCode === "ti" ||
+    params.targetLangCode === "ti";
 
   const sourceHint = isBidirectional
     ? `This is a two-way conversation between ${sourceLang.name} (${sourceLang.nativeName}) [code: ${sourceLang.code}] and ${targetLang.name} (${targetLang.nativeName}) [code: ${targetLang.code}]. Detect which of these two languages was used: if it is ${sourceLang.name}, translate into ${targetLang.name}; if it is ${targetLang.name}, translate into ${sourceLang.name}.`
@@ -199,13 +205,20 @@ async function transcribeAndTranslate(params: {
     ? `Auto-detect the spoken language and translate into ${targetLang.name} (${targetLang.nativeName}).`
     : `The speaker is speaking ${sourceLang.name} (${sourceLang.nativeName}). Translate into ${targetLang.name} (${targetLang.nativeName}).`;
 
+  const ethiopicRules = involvesEthiopic
+    ? `
+ETHIOPIC / AMHARIC PRECISION RULES:
+- For Amharic (አማርኛ) or Tigrinya (ትግርኛ), transcribe and translate strictly in authentic Ethiopic/Ge'ez Fidel script (ፊደል), using real, standard words and exact vowel orders (ግዕዝ፣ ካዕብ፣ ሣልስ፣ ራብዕ፣ ኃምስ፣ ሳድስ፣ ሳብዕ).
+- Carefully distinguish ejective vs plain consonants (ተ/ጠ, ቸ/ጨ, ፐ/ጰ, ቀ/ከ, ሰ/ሸ/ጸ) from the speech acoustics—never substitute random look-alike Fidel characters or garbled syllables.`
+    : "";
+
   const promptText = params.audioBase64
-    ? `Listen closely—even to soft, whispered, or distant speech. ${sourceHint}
-1) Transcribe EVERY single spoken word and syllable verbatim in its original language and native script (e.g., Ge'ez/Ethiopic script for Amharic or Tigrinya, Arabic script for Arabic, Chinese characters for Chinese). Do NOT drop, summarize, or abbreviate any word. Only if there is strictly zero intelligible speech, return empty strings for all fields.
-2) Translate EVERY word completely, accurately, and naturally into the destination language so the listener hears every detail clearly.
+    ? `Listen closely to the audio—including soft, whispered, or distant speech. ${sourceHint}${ethiopicRules}
+1) Transcribe EVERY single spoken word accurately in its original language and native script. Do NOT invent words from background noise; if there is no clear speech, return empty strings for all fields.
+2) Translate the full meaning accurately, naturally, and completely into the destination language with zero omitted words.
 Return strict JSON.`
-    : `${sourceHint}
-Translate every word completely and faithfully with zero omissions.
+    : `${sourceHint}${ethiopicRules}
+Translate every word completely, accurately, and naturally with zero omissions.
 Text to translate: """${params.text ?? ""}"""
 Return strict JSON with sourceTranscript equal to the original text, detectedLanguage, resolvedSourceLang (BCP-47 code), resolvedTargetLang (BCP-47 code), and translatedText.`;
 
@@ -695,17 +708,17 @@ function feedRoomChannelVadFrame(
   if (pcmBuf.length < 4) return;
   const rms = computePcm16Rms(pcmBuf);
   const now = Date.now();
-  const SPEECH_THRESHOLD = Math.max(0.0038, channel.vadNoiseFloor * 2.15);
-  const SILENCE_HANG_MS = 380;
-  const MAX_UTTERANCE_MS = 5500;
-  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms catches short words cleanly
+  const SPEECH_THRESHOLD = Math.max(0.0042, channel.vadNoiseFloor * 2.2);
+  const SILENCE_HANG_MS = 520;
+  const MAX_UTTERANCE_MS = 6500;
+  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.3; // 300ms avoids cutting short words/syllables
 
   if (!channel.vadSpeechActive) {
     if (rms < SPEECH_THRESHOLD) {
       channel.vadNoiseFloor = channel.vadNoiseFloor * 0.92 + rms * 0.08;
     }
     channel.vadPreRoll.push(pcmBuf);
-    if (channel.vadPreRoll.length > 3) channel.vadPreRoll.shift();
+    if (channel.vadPreRoll.length > 4) channel.vadPreRoll.shift();
     if (rms >= SPEECH_THRESHOLD) {
       channel.vadSpeechActive = true;
       channel.vadSpeechStartAt = now;
@@ -1131,6 +1144,74 @@ async function startServer() {
     }
   });
 
+  // Fast translation endpoint (returns text immediately without blocking for full WAV synthesis)
+  app.post("/api/translate-fast", async (req, res) => {
+    try {
+      const { audioBase64, mimeType, text, sourceLang, targetLang, bidirectional } = req.body ?? {};
+      const safeSource = sanitizeLangCode(sourceLang, true);
+      const safeTarget = sanitizeLangCode(targetLang, false);
+      const isBidirectional = Boolean(bidirectional);
+
+      if (!audioBase64 && (!text || typeof text !== "string" || !text.trim())) {
+        res.status(400).json({ error: "Either audioBase64 or non-empty text is required." });
+        return;
+      }
+
+      const translated = await transcribeAndTranslate({
+        audioBase64: typeof audioBase64 === "string" ? audioBase64 : undefined,
+        mimeType: typeof mimeType === "string" ? mimeType : "audio/webm",
+        text: typeof text === "string" ? text.trim() : undefined,
+        sourceLangCode: safeSource,
+        targetLangCode: safeTarget,
+        bidirectional: isBidirectional,
+      });
+
+      res.json({
+        sourceTranscript: translated.sourceTranscript,
+        detectedLanguage: translated.detectedLanguage,
+        translatedText: translated.translatedText,
+        resolvedSourceLang: translated.resolvedSourceLang,
+        resolvedTargetLang: translated.resolvedTargetLang,
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  // Raw 24kHz PCM16LE streaming TTS endpoint (starts playing on chunk 1 with near-zero delay)
+  app.post("/api/tts-stream", async (req, res) => {
+    const { text, voiceName } = req.body ?? {};
+    if (typeof text !== "string" || !text.trim()) {
+      res.status(400).json({ error: "Text is required." });
+      return;
+    }
+    const safeVoice = sanitizeVoice(voiceName);
+
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Sample-Rate", "24000");
+
+    try {
+      const emitted = await synthesizeSpeechStream(text.trim(), safeVoice, (pcmBase64) => {
+        if (!res.writableEnded) {
+          res.write(Buffer.from(pcmBase64, "base64"));
+        }
+      });
+      if (!emitted && !res.headersSent) {
+        res.status(204).end();
+        return;
+      }
+      res.end();
+    } catch {
+      if (!res.headersSent) {
+        res.status(204).end();
+      } else {
+        res.end();
+      }
+    }
+  });
+
   // Create a multi-device translation room
   app.post("/api/rooms", (_req, res) => {
     const code = generateRoomCode();
@@ -1311,17 +1392,17 @@ async function startServer() {
       if (pcmBuf.length < 4) return;
       const rms = computePcm16Rms(pcmBuf);
       const now = Date.now();
-      const SPEECH_THRESHOLD = Math.max(0.0038, vadNoiseFloor * 2.15);
-      const SILENCE_HANG_MS = 380;
-      const MAX_UTTERANCE_MS = 5500;
-      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms
+      const SPEECH_THRESHOLD = Math.max(0.0042, vadNoiseFloor * 2.2);
+      const SILENCE_HANG_MS = 520;
+      const MAX_UTTERANCE_MS = 6500;
+      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.3; // 300ms avoids cutting short words/syllables
 
       if (!vadSpeechActive) {
         if (rms < SPEECH_THRESHOLD) {
           vadNoiseFloor = vadNoiseFloor * 0.92 + rms * 0.08;
         }
         vadPreRoll.push(pcmBuf);
-        if (vadPreRoll.length > 3) vadPreRoll.shift();
+        if (vadPreRoll.length > 4) vadPreRoll.shift();
         if (rms >= SPEECH_THRESHOLD) {
           vadSpeechActive = true;
           vadSpeechStartAt = now;

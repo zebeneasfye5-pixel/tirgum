@@ -15,6 +15,7 @@ import {
   Download,
   Share2,
   Ear,
+  Trash2,
 } from "lucide-react";
 import { UI_COPY, UiLang } from "../data/i18n";
 import { getLanguageByCode, VOICE_PROFILES, VoiceId } from "../data/languages";
@@ -897,8 +898,20 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
 
             {liveCaption && (liveCaption.sourceText || liveCaption.translatedText) && (
               <div className="rounded-lg border border-blue-300 bg-blue-50/70 px-4 py-3">
-                <div className="text-sm font-extrabold text-blue-900">
-                  {t.liveCaptionsTitle} · {liveCaption.speakerName}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-extrabold text-blue-900">
+                    {t.liveCaptionsTitle} · {liveCaption.speakerName}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setLiveCaption(null)}
+                    title={t.deleteItem}
+                    aria-label={t.deleteItem}
+                    className="inline-flex h-7 items-center gap-1 rounded-md border border-blue-200 bg-white px-2 text-xs font-bold text-slate-700 hover:border-red-300 hover:bg-red-50 hover:text-red-700"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    <span>{t.deleteItem}</span>
+                  </button>
                 </div>
                 {liveCaption.translatedText && (
                   <p className="mt-1 text-lg font-bold text-slate-950">
@@ -942,7 +955,21 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                       <span className="truncate text-slate-900">
                         {m.speakerName} · {srcLang.nativeName} → {tgtLang.nativeName}
                       </span>
-                      <span className="font-mono shrink-0 tabular-nums">{timeStr}</span>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className="font-mono tabular-nums">{timeStr}</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setMessages((prev) => prev.filter((item) => item.id !== m.id))
+                          }
+                          title={t.deleteItem}
+                          aria-label={t.deleteItem}
+                          className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-300 bg-white px-2 text-xs font-bold text-slate-700 transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-700"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>{t.deleteItem}</span>
+                        </button>
+                      </div>
                     </div>
                     <p className="mt-1.5 text-lg font-bold leading-relaxed text-slate-950">
                       {m.translatedText}
