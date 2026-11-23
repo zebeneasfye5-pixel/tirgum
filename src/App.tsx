@@ -16,6 +16,7 @@ import {
   Volume2,
   VolumeX,
   Download,
+  Gauge,
 } from "lucide-react";
 import { UI_COPY, UiLang } from "./data/i18n";
 import {
@@ -27,7 +28,9 @@ import {
 import {
   blobToBase64,
   BoostedMicPipeline,
+  computeFloat32Rms,
   createBoostedMicPipeline,
+  detectSlowNetwork,
   downsampleTo16k,
   float32ToPcm16Base64,
   GaplessPcmPlayer,
@@ -37,9 +40,10 @@ import {
 import { WaveformCanvas } from "./components/WaveformCanvas";
 import { LanguagePickerModal } from "./components/LanguagePickerModal";
 import { RemoteRoomView } from "./components/RemoteRoomView";
+import { DocumentTranslatorView } from "./components/DocumentTranslatorView";
 import { OfflineIndicator, PWAInstallButton } from "./components/PWAInstallButton";
 
-type StudioMode = "face" | "room";
+type StudioMode = "face" | "room" | "doc";
 type EngineMode = "live" | "turn";
 
 interface TranscriptEntry {
@@ -90,6 +94,12 @@ export default function App() {
   const [autoPlay, setAutoPlay] = useState<boolean>(true);
   const [whisperBoost, setWhisperBoost] = useState<boolean>(() => {
     return localStorage.getItem("lissan_whisper_boost") !== "false";
+  });
+  const [autoSlowDetected] = useState<boolean>(() => detectSlowNetwork());
+  const [lowBandwidth, setLowBandwidth] = useState<boolean>(() => {
+    const saved = localStorage.getItem("lissan_low_network");
+    if (saved === "true" || saved === "false") return saved === "true";
+    return detectSlowNetwork();
   });
 
   const [pickerTarget, setPickerTarget] = useState<"source" | "target" | null>(null);
@@ -199,6 +209,10 @@ export default function App() {
   }, [whisperBoost]);
 
   useEffect(() => {
+    localStorage.setItem("lissan_low_network", String(lowBandwidth));
+  }, [lowBandwidth]);
+
+  useEffect(() => {
     sourceLangRef.current = sourceLang;
   }, [sourceLang]);
 
@@ -285,6 +299,8 @@ export default function App() {
         targetLang,
         voiceName,
         bidirectional: String(bidirectional && sourceLang !== "auto"),
+        lowBandwidth: String(lowBandwidth),
+        whisperBoost: String(whisperBoostRef.current),
       });
       const ws = new WebSocket(
         `${protocol}//${window.location.host}/ws/live?${params.toString()}`
@@ -292,6 +308,10 @@ export default function App() {
       liveWsRef.current = ws;
 
       ws.onopen = () => {
+        const preRollQueue: string[] = [];
+        let speechGateActive = false;
+        let hangoverFrames = 0;
+
         pipeline.processor.onaudioprocess = (e) => {
           if (ws.readyState !== WebSocket.OPEN || userStoppedLiveRef.current) return;
           if (pipeline.ctx.state === "suspended") {
@@ -299,8 +319,30 @@ export default function App() {
           }
           const rawChannel = e.inputBuffer.getChannelData(0);
           const pcm16k = downsampleTo16k(rawChannel, pipeline.ctx.sampleRate);
+          const rms = computeFloat32Rms(pcm16k);
           const base64 = float32ToPcm16Base64(pcm16k);
-          ws.send(JSON.stringify({ type: "audio", data: base64 }));
+          const gateThreshold = whisperBoostRef.current ? 0.0022 : 0.0038;
+
+          if (rms >= gateThreshold) {
+            if (!speechGateActive) {
+              speechGateActive = true;
+              while (preRollQueue.length > 0) {
+                ws.send(JSON.stringify({ type: "audio", data: preRollQueue.shift()! }));
+              }
+            }
+            hangoverFrames = 7; // ~450ms trailing hangover
+            ws.send(JSON.stringify({ type: "audio", data: base64 }));
+          } else if (speechGateActive) {
+            ws.send(JSON.stringify({ type: "audio", data: base64 }));
+            hangoverFrames -= 1;
+            if (hangoverFrames <= 0) {
+              speechGateActive = false;
+              ws.send(JSON.stringify({ type: "vad_flush" }));
+            }
+          } else {
+            preRollQueue.push(base64);
+            if (preRollQueue.length > 5) preRollQueue.shift();
+          }
         };
       };
 
@@ -315,14 +357,18 @@ export default function App() {
             }
           } else if (msg.type === "inputTranscript" && msg.text) {
             setNoticeBanner(null);
-            liveInputAccRef.current += msg.text;
+            liveInputAccRef.current = msg.replace
+              ? msg.text
+              : liveInputAccRef.current + msg.text;
             setLiveInputText(liveInputAccRef.current);
           } else if (msg.type === "outputTranscript" && msg.text) {
             setNoticeBanner(null);
-            liveOutputAccRef.current += msg.text;
+            liveOutputAccRef.current = msg.replace
+              ? msg.text
+              : liveOutputAccRef.current + msg.text;
             setLiveOutputText(liveOutputAccRef.current);
           } else if (msg.type === "audio" && msg.data) {
-            playerRef.current?.enqueuePcm24kBase64(msg.data);
+            playerRef.current?.enqueuePcmBase64(msg.data, Number(msg.sampleRate) || 24000);
           } else if (msg.type === "audioWav" && msg.data) {
             void playerRef.current?.enqueueWavBase64(msg.data);
           } else if (msg.type === "fallbackSpeak" && msg.text) {
@@ -340,8 +386,8 @@ export default function App() {
               setHistory((prev) => [
                 {
                   id: `live_${Date.now()}`,
-                  sourceLang: sourceLangRef.current,
-                  targetLang: targetLangRef.current,
+                  sourceLang: msg.resolvedSourceLang || sourceLangRef.current,
+                  targetLang: msg.resolvedTargetLang || targetLangRef.current,
                   sourceText: committedIn,
                   translatedText: committedOut,
                   timestamp: Date.now(),
@@ -375,7 +421,16 @@ export default function App() {
         }
       };
     },
-    [bidirectional, sourceLang, targetLang, voiceName, stopLiveSession, t.errorGeneric, t.highTrafficWait]
+    [
+      bidirectional,
+      lowBandwidth,
+      sourceLang,
+      stopLiveSession,
+      t.errorGeneric,
+      t.highTrafficWait,
+      targetLang,
+      voiceName,
+    ]
   );
 
   const startLiveSession = useCallback(async () => {
@@ -451,7 +506,7 @@ export default function App() {
         const res = await fetch("/api/tts-stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: cleaned, voiceName }),
+          body: JSON.stringify({ text: cleaned, voiceName, lowBandwidth }),
         });
         if (!res.ok || res.status === 204 || !res.body) {
           if (autoPlayRef.current) {
@@ -459,6 +514,8 @@ export default function App() {
           }
           return;
         }
+        const rateHeader = Number(res.headers.get("X-Sample-Rate"));
+        const sampleRate = rateHeader === 12000 || lowBandwidth ? 12000 : 24000;
         const reader = res.body.getReader();
         let leftover: number | null = null;
         let receivedAny = false;
@@ -482,7 +539,7 @@ export default function App() {
           }
           if (bytes.byteLength >= 2) {
             receivedAny = true;
-            player.enqueuePcm24kBytes(bytes);
+            player.enqueuePcmBytes(bytes, sampleRate, 1.0);
           }
         }
         if (!receivedAny && autoPlayRef.current) {
@@ -494,7 +551,7 @@ export default function App() {
         }
       }
     },
-    [voiceName]
+    [lowBandwidth, voiceName]
   );
 
   const executeTurnTranslation = useCallback(
@@ -744,6 +801,13 @@ export default function App() {
               {t.navRooms}
             </a>
             <a
+              href="#studio"
+              onClick={() => handleModeSwitch("doc")}
+              className="hover:text-blue-700 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+            >
+              {t.navDocuments}
+            </a>
+            <a
               href="#history"
               className="hover:text-blue-700 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
@@ -798,7 +862,7 @@ export default function App() {
             <div className="flex flex-wrap items-center gap-3 shrink-0">
               <PWAInstallButton uiLang={uiLang} />
 
-              <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white p-1">
+              <div className="inline-flex flex-wrap items-center rounded-lg border border-slate-300 bg-white p-1">
                 <button
                   type="button"
                   onClick={() => handleModeSwitch("face")}
@@ -820,6 +884,17 @@ export default function App() {
                   }`}
                 >
                   {t.modeRemoteRoom}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleModeSwitch("doc")}
+                  className={`rounded-md px-3.5 py-2 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
+                    studioMode === "doc"
+                      ? "bg-slate-900 text-white"
+                      : "text-slate-700 hover:text-slate-950"
+                  }`}
+                >
+                  {t.modeDocument}
                 </button>
               </div>
 
@@ -850,8 +925,29 @@ export default function App() {
             </div>
           </div>
 
+          {autoSlowDetected && lowBandwidth && (
+            <div className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50/70 px-4 py-2 text-sm font-bold text-blue-900">
+              <Gauge className="h-4 w-4 shrink-0" />
+              <span>{t.lowNetworkAutoNotice}</span>
+            </div>
+          )}
+
           {studioMode === "room" ? (
-            <RemoteRoomView uiLang={uiLang} initialRoomCode={initialRoomParam} />
+            <RemoteRoomView
+              uiLang={uiLang}
+              initialRoomCode={initialRoomParam}
+              lowBandwidth={lowBandwidth}
+              onLowBandwidthChange={setLowBandwidth}
+            />
+          ) : studioMode === "doc" ? (
+            <DocumentTranslatorView
+              uiLang={uiLang}
+              defaultSourceLang={sourceLang}
+              defaultTargetLang={targetLang}
+              voiceName={voiceName}
+              onVoiceChange={setVoiceName}
+              lowBandwidth={lowBandwidth}
+            />
           ) : (
             <div className="space-y-4">
               {/* Sub-toolbar for Face-to-Face Engine & Voice */}
@@ -959,6 +1055,23 @@ export default function App() {
                   >
                     <Ear className="h-4 w-4" />
                     <span>{t.whisperBoostLabel}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (liveStatus !== "idle") stopLiveSession();
+                      setLowBandwidth((v) => !v);
+                    }}
+                    aria-pressed={lowBandwidth}
+                    className={`inline-flex h-10 items-center gap-1.5 rounded-lg border px-3.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
+                      lowBandwidth
+                        ? "border-blue-300 bg-blue-50 text-blue-900"
+                        : "border-slate-300 bg-white text-slate-800 hover:bg-slate-50"
+                    }`}
+                  >
+                    <Gauge className="h-4 w-4" />
+                    <span>{t.lowNetworkShort}</span>
                   </button>
 
                   <button

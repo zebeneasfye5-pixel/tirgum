@@ -11,7 +11,10 @@ import {
   ThinkingLevel,
   Type,
 } from "@google/genai";
+import mammoth from "mammoth";
 import { WORLD_LANGUAGES, VOICE_PROFILES, getLanguageByCode } from "./src/data/languages.ts";
+
+const PRECISION_VOICE_LANGS = new Set(["am", "ti", "om", "so", "ha", "yo", "ig", "zu", "af"]);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,12 +143,29 @@ function normalizePcm16Buffer(pcmBuffer: Buffer): Buffer {
     return pcmBuffer;
   }
 
-  const gain = Math.min(4.5, 17500 / peak);
+  const gain = Math.min(5.0, 18500 / peak);
   const out = Buffer.allocUnsafe(pcmBuffer.length);
   for (let i = 0; i < sampleCount; i++) {
     const boosted = Math.round(pcmBuffer.readInt16LE(i * 2) * gain);
     const clamped = Math.max(-32768, Math.min(32767, boosted));
     out.writeInt16LE(clamped, i * 2);
+  }
+  return out;
+}
+
+/**
+ * Downsamples 24kHz PCM16LE mono buffer 2:1 to 12kHz with a 2-tap averaging
+ * anti-alias filter, cutting mobile network bandwidth in half (50% savings).
+ */
+function downsample24kTo12kPcm16(pcm24k: Buffer): Buffer {
+  const sampleCount = Math.floor(pcm24k.length / 2);
+  const outSamples = Math.floor(sampleCount / 2);
+  if (outSamples <= 0) return Buffer.alloc(0);
+  const out = Buffer.allocUnsafe(outSamples * 2);
+  for (let i = 0; i < outSamples; i++) {
+    const s0 = pcm24k.readInt16LE(i * 4);
+    const s1 = pcm24k.readInt16LE(i * 4 + 2);
+    out.writeInt16LE((s0 + s1) >> 1, i * 2);
   }
   return out;
 }
@@ -301,6 +321,143 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
   };
 }
 
+function parseStreamingTaggedOutput(rawText: string): TranslatedTurnResult {
+  const clean = rawText.trim();
+  if (!clean || clean === "NONE" || clean.startsWith("NONE\n")) {
+    return { sourceTranscript: "", detectedLanguage: "", translatedText: "" };
+  }
+  let resolvedSourceLang: string | undefined;
+  let resolvedTargetLang: string | undefined;
+  let detectedLanguage = "";
+
+  const langMatch = clean.match(/^LANG:\s*([^\n]+)/m);
+  if (langMatch) {
+    const parts = langMatch[1].split("|").map((s) => s.trim());
+    if (parts[0] && parts[0] !== "none") resolvedSourceLang = parts[0];
+    if (parts[1] && parts[1] !== "none") resolvedTargetLang = parts[1];
+    if (parts[2]) detectedLanguage = parts[2];
+  }
+
+  const srcIdx = clean.indexOf("SRC:");
+  const trIdx = clean.indexOf("\nTR:");
+  let sourceTranscript = "";
+  let translatedText = "";
+
+  if (srcIdx !== -1) {
+    const srcStart = srcIdx + 4;
+    const srcEnd = trIdx !== -1 ? trIdx : clean.length;
+    sourceTranscript = clean.slice(srcStart, srcEnd).trim();
+  }
+  if (trIdx !== -1) {
+    translatedText = clean.slice(trIdx + 4).trim();
+  }
+
+  if (sourceTranscript.toUpperCase() === "NONE") sourceTranscript = "";
+  if (translatedText.toUpperCase() === "NONE") translatedText = "";
+
+  return {
+    sourceTranscript,
+    detectedLanguage,
+    translatedText,
+    resolvedSourceLang,
+    resolvedTargetLang,
+  };
+}
+
+async function transcribeAndTranslateStream(params: {
+  audioBase64: string;
+  mimeType: string;
+  sourceLangCode: string;
+  targetLangCode: string;
+  bidirectional?: boolean;
+  onPartial?: (partial: TranslatedTurnResult) => void;
+}): Promise<TranslatedTurnResult> {
+  const ai = getAiClient();
+  const targetLang = getLanguageByCode(params.targetLangCode);
+  const sourceLang =
+    params.sourceLangCode === "auto" ? null : getLanguageByCode(params.sourceLangCode);
+  const isBidirectional =
+    Boolean(params.bidirectional) && sourceLang !== null && sourceLang.code !== targetLang.code;
+  const involvesEthiopic =
+    params.sourceLangCode === "am" ||
+    params.targetLangCode === "am" ||
+    params.sourceLangCode === "ti" ||
+    params.targetLangCode === "ti";
+
+  const directionPrompt = isBidirectional
+    ? `Two-way conversation between ${sourceLang.name} (${sourceLang.nativeName}) [${sourceLang.code}] and ${targetLang.name} (${targetLang.nativeName}) [${targetLang.code}]. If spoken in ${sourceLang.name}, translate to ${targetLang.name}; if spoken in ${targetLang.name}, translate to ${sourceLang.name}.`
+    : sourceLang === null
+    ? `Auto-detect the spoken language and translate into ${targetLang.name} (${targetLang.nativeName}) [${targetLang.code}].`
+    : `Speaker is using ${sourceLang.name} (${sourceLang.nativeName}) [${sourceLang.code}]. Translate into ${targetLang.name} (${targetLang.nativeName}) [${targetLang.code}].`;
+
+  const ethiopicRules = involvesEthiopic
+    ? `\nETHIOPIC / AMHARIC ACCURACY: Transcribe and translate Amharic (አማርኛ) / Tigrinya (ትግርኛ) strictly in standard Ethiopic Fidel script (ፊደል). Distinguish ejective vs plain consonants (ተ/ጠ, ቸ/ጨ, ፐ/ጰ, ቀ/ከ, ሰ/ሸ/ጸ) and exact vowel orders accurately.`
+    : "";
+
+  const promptText = `Listen very carefully to the audio—including low-tone, quiet, whispered, or distant speech. ${directionPrompt}${ethiopicRules}
+Transcribe EVERY single spoken word faithfully in its native script, and translate the full natural meaning with zero omissions.
+If there is NO human speech (only noise/silence), output exactly: NONE
+Otherwise, output ONLY in this exact 3-line format (no markdown, no extra text):
+LANG: <detected BCP-47 source code>|<target BCP-47 code>|<Language English Name>
+SRC: <exact word-for-word transcript>
+TR: <complete natural translation>`;
+
+  const parts = [
+    {
+      inlineData: {
+        mimeType: params.mimeType || "audio/wav",
+        data: params.audioBase64,
+      },
+    },
+    { text: promptText },
+  ];
+
+  try {
+    const stream = await ai.models.generateContentStream({
+      model: "gemini-4-hydrogen",
+      contents: { parts },
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+      },
+    });
+    let fullText = "";
+    let lastSrcSent = "";
+    let lastTrSent = "";
+    for await (const chunk of stream) {
+      if (chunk.text) {
+        fullText += chunk.text;
+        if (params.onPartial) {
+          const parsed = parseStreamingTaggedOutput(fullText);
+          if (
+            parsed.sourceTranscript !== lastSrcSent ||
+            parsed.translatedText !== lastTrSent
+          ) {
+            lastSrcSent = parsed.sourceTranscript;
+            lastTrSent = parsed.translatedText;
+            params.onPartial(parsed);
+          }
+        }
+      }
+    }
+    return parseStreamingTaggedOutput(fullText);
+  } catch (err) {
+    if (isRetryableQuotaOrLoadError(err)) {
+      const fallback = await transcribeAndTranslate({
+        audioBase64: params.audioBase64,
+        mimeType: params.mimeType,
+        sourceLangCode: params.sourceLangCode,
+        targetLangCode: params.targetLangCode,
+        bidirectional: params.bidirectional,
+      });
+      if (params.onPartial && (fallback.sourceTranscript || fallback.translatedText)) {
+        params.onPartial(fallback);
+      }
+      return fallback;
+    }
+    throw err;
+  }
+}
+
 async function translateTextOnly(params: {
   text: string;
   sourceLangName: string;
@@ -406,13 +563,14 @@ async function synthesizeSpeechWav(text: string, voiceName: string): Promise<str
 }
 
 /**
- * Streams raw headerless 24kHz PCM16 chunks immediately as Gemini synthesizes them,
- * eliminating the buffering wait of unary WAV responses.
+ * Streams raw headerless 24kHz PCM16 chunks immediately as Gemini synthesizes them.
+ * Always passes raw 24kHz Buffer chunks so callers can relay either full 24kHz
+ * or downsampled 12kHz (Low-Network Mode) per listener.
  */
 async function synthesizeSpeechStream(
   text: string,
   voiceName: string,
-  onPcmChunk: (base64Pcm24k: string) => void
+  onPcm24kChunk: (pcm24kBuffer: Buffer) => void
 ): Promise<boolean> {
   if (!text.trim()) return false;
   const ai = getAiClient("v1beta");
@@ -451,7 +609,7 @@ async function synthesizeSpeechStream(
         const audioData = part.inlineData?.data;
         if (audioData) {
           emitted = true;
-          onPcmChunk(audioData);
+          onPcm24kChunk(Buffer.from(audioData, "base64"));
         }
       }
     }
@@ -511,6 +669,8 @@ interface RoomParticipant {
   langCode: string;
   voiceName: string;
   liveCallActive: boolean;
+  lowBandwidth: boolean;
+  whisperBoost: boolean;
   liveTranslators: Map<string, LiveTranslatorChannel>;
   ws: WebSocket;
   joinedAt: number;
@@ -596,11 +756,52 @@ async function drainRoomChannelVadQueue(
       }
       const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
       try {
-        const result = await transcribeAndTranslate({
+        const result = await transcribeAndTranslateStream({
           audioBase64: wavBase64,
           mimeType: "audio/wav",
           sourceLangCode: speaker.langCode,
           targetLangCode: channel.targetLangCode,
+          onPartial: (partial) => {
+            if (channel.closed) return;
+            if (partial.sourceTranscript) {
+              const capPayload = JSON.stringify({
+                type: "room:live_caption",
+                speakerId: speaker.id,
+                speakerName: speaker.name,
+                sourceLang: speaker.langCode,
+                text: partial.sourceTranscript,
+              });
+              if (speaker.ws.readyState === WebSocket.OPEN) speaker.ws.send(capPayload);
+              for (const p of room.participants.values()) {
+                if (
+                  p.id !== speaker.id &&
+                  p.langCode === channel.targetLangCode &&
+                  p.ws.readyState === WebSocket.OPEN
+                ) {
+                  p.ws.send(capPayload);
+                }
+              }
+            }
+            if (partial.translatedText) {
+              const outCapPayload = JSON.stringify({
+                type: "room:live_translated_caption",
+                speakerId: speaker.id,
+                speakerName: speaker.name,
+                sourceLang: speaker.langCode,
+                targetLang: channel.targetLangCode,
+                text: partial.translatedText,
+              });
+              for (const p of room.participants.values()) {
+                if (
+                  p.id !== speaker.id &&
+                  p.langCode === channel.targetLangCode &&
+                  p.ws.readyState === WebSocket.OPEN
+                ) {
+                  p.ws.send(outCapPayload);
+                }
+              }
+            }
+          },
         });
         if (channel.closed || !result.sourceTranscript || !result.translatedText) {
           continue;
@@ -648,25 +849,51 @@ async function drainRoomChannelVadQueue(
           }
         }
 
-        // Stream 24kHz PCM chunks live to listeners
+        // Stream 24kHz (normal) or 12kHz (low-bandwidth) PCM chunks live to listeners
+        let leftoverLow: Buffer | null = null;
         const streamed = await synthesizeSpeechStream(
           result.translatedText,
           speaker.voiceName,
-          (pcmBase64) => {
+          (pcm24kBuf) => {
             if (channel.closed) return;
-            const audioPayload = JSON.stringify({
+            const fullPayload = JSON.stringify({
               type: "room:live_audio_out",
               speakerId: speaker.id,
               targetLang: channel.targetLangCode,
-              data: pcmBase64,
+              sampleRate: 24000,
+              data: pcm24kBuf.toString("base64"),
             });
+            let lowPayload: string | null = null;
+
             for (const p of room.participants.values()) {
               if (
                 p.id !== speaker.id &&
                 p.langCode === channel.targetLangCode &&
                 p.ws.readyState === WebSocket.OPEN
               ) {
-                p.ws.send(audioPayload);
+                if (p.lowBandwidth) {
+                  if (lowPayload === null) {
+                    const combined = leftoverLow
+                      ? Buffer.concat([leftoverLow, pcm24kBuf])
+                      : pcm24kBuf;
+                    const usableBytes = Math.floor(combined.length / 4) * 4;
+                    leftoverLow =
+                      combined.length > usableBytes ? combined.subarray(usableBytes) : null;
+                    if (usableBytes >= 4) {
+                      const down12k = downsample24kTo12kPcm16(combined.subarray(0, usableBytes));
+                      lowPayload = JSON.stringify({
+                        type: "room:live_audio_out",
+                        speakerId: speaker.id,
+                        targetLang: channel.targetLangCode,
+                        sampleRate: 12000,
+                        data: down12k.toString("base64"),
+                      });
+                    }
+                  }
+                  if (lowPayload) p.ws.send(lowPayload);
+                } else {
+                  p.ws.send(fullPayload);
+                }
               }
             }
           }
@@ -708,17 +935,19 @@ function feedRoomChannelVadFrame(
   if (pcmBuf.length < 4) return;
   const rms = computePcm16Rms(pcmBuf);
   const now = Date.now();
-  const SPEECH_THRESHOLD = Math.max(0.0042, channel.vadNoiseFloor * 2.2);
-  const SILENCE_HANG_MS = 520;
+  const minFloor = speaker.whisperBoost ? 0.0024 : 0.0040;
+  const multiplier = speaker.whisperBoost ? 1.85 : 2.15;
+  const SPEECH_THRESHOLD = Math.max(minFloor, channel.vadNoiseFloor * multiplier);
+  const SILENCE_HANG_MS = 450;
   const MAX_UTTERANCE_MS = 6500;
-  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.3; // 300ms avoids cutting short words/syllables
+  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.24; // 240ms catches crisp short words
 
   if (!channel.vadSpeechActive) {
     if (rms < SPEECH_THRESHOLD) {
       channel.vadNoiseFloor = channel.vadNoiseFloor * 0.92 + rms * 0.08;
     }
     channel.vadPreRoll.push(pcmBuf);
-    if (channel.vadPreRoll.length > 4) channel.vadPreRoll.shift();
+    if (channel.vadPreRoll.length > 5) channel.vadPreRoll.shift();
     if (rms >= SPEECH_THRESHOLD) {
       channel.vadSpeechActive = true;
       channel.vadSpeechStartAt = now;
@@ -758,6 +987,19 @@ async function openRoomTranslatorChannel(
 
   const targetLang = getLanguageByCode(targetLangCode);
   const sourceLang = getLanguageByCode(speaker.langCode);
+
+  const requirePrecisionEngine =
+    speaker.lowBandwidth ||
+    PRECISION_VOICE_LANGS.has(speaker.langCode) ||
+    PRECISION_VOICE_LANGS.has(targetLangCode) ||
+    !targetLang.liveTranslateSupported;
+
+  if (requirePrecisionEngine) {
+    channel.mode = "vad_stream";
+    channel.connecting = false;
+    return;
+  }
+
   let usedFallback = false;
 
   const connectWithModel = async (
@@ -1065,6 +1307,38 @@ function reconcileAllRoomTranslators(room: RoomState) {
   }
 }
 
+function splitReportIntoReadableSections(text: string): string[] {
+  const cleaned = text.trim();
+  if (!cleaned) return [];
+  const rawParagraphs = cleaned
+    .split(/\n{1,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const sections: string[] = [];
+  for (const para of rawParagraphs) {
+    if (para.length <= 420) {
+      sections.push(para);
+      continue;
+    }
+    // Split long paragraphs on Ethiopic (።) or Latin/CJK sentence delimiters cleanly
+    const sentences = para.match(/[^.!?።;\n]+[.!?።;\n]*/g) ?? [para];
+    let current = "";
+    for (const s of sentences) {
+      const part = s.trim();
+      if (!part) continue;
+      if (current && current.length + part.length + 1 > 380) {
+        sections.push(current);
+        current = part;
+      } else {
+        current = current ? `${current} ${part}` : part;
+      }
+    }
+    if (current) sections.push(current);
+  }
+  return sections;
+}
+
 async function startServer() {
   const app = express();
   app.set("trust proxy", 1);
@@ -1073,7 +1347,7 @@ async function startServer() {
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     next();
   });
-  app.use(express.json({ limit: "15mb" }));
+  app.use(express.json({ limit: "25mb" }));
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
@@ -1179,23 +1453,33 @@ async function startServer() {
     }
   });
 
-  // Raw 24kHz PCM16LE streaming TTS endpoint (starts playing on chunk 1 with near-zero delay)
+  // Raw PCM16LE streaming TTS endpoint (24kHz standard OR 12kHz Low-Network Mode)
   app.post("/api/tts-stream", async (req, res) => {
-    const { text, voiceName } = req.body ?? {};
+    const { text, voiceName, lowBandwidth } = req.body ?? {};
     if (typeof text !== "string" || !text.trim()) {
       res.status(400).json({ error: "Text is required." });
       return;
     }
     const safeVoice = sanitizeVoice(voiceName);
+    const isLowBandwidth = Boolean(lowBandwidth);
 
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Sample-Rate", "24000");
+    res.setHeader("X-Sample-Rate", isLowBandwidth ? "12000" : "24000");
 
+    let leftoverLow: Buffer | null = null;
     try {
-      const emitted = await synthesizeSpeechStream(text.trim(), safeVoice, (pcmBase64) => {
-        if (!res.writableEnded) {
-          res.write(Buffer.from(pcmBase64, "base64"));
+      const emitted = await synthesizeSpeechStream(text.trim(), safeVoice, (pcm24kBuf) => {
+        if (res.writableEnded) return;
+        if (isLowBandwidth) {
+          const combined = leftoverLow ? Buffer.concat([leftoverLow, pcm24kBuf]) : pcm24kBuf;
+          const usableBytes = Math.floor(combined.length / 4) * 4;
+          leftoverLow = combined.length > usableBytes ? combined.subarray(usableBytes) : null;
+          if (usableBytes >= 4) {
+            res.write(downsample24kTo12kPcm16(combined.subarray(0, usableBytes)));
+          }
+        } else {
+          res.write(pcm24kBuf);
         }
       });
       if (!emitted && !res.headersSent) {
@@ -1209,6 +1493,199 @@ async function startServer() {
       } else {
         res.end();
       }
+    }
+  });
+
+  // Full Document & Report Translator (PDF, DOCX, TXT/CSV/MD, or document images -> full translation + audio sections)
+  app.post("/api/translate-document", async (req, res) => {
+    try {
+      const { text, fileName, mimeType, fileBase64, sourceLang, targetLang } = req.body ?? {};
+      const safeSource = sanitizeLangCode(sourceLang, true);
+      const safeTarget = sanitizeLangCode(targetLang, false);
+      const targetObj = getLanguageByCode(safeTarget);
+      const sourceObj = safeSource === "auto" ? null : getLanguageByCode(safeSource);
+      const ai = getAiClient();
+
+      const lowerName = typeof fileName === "string" ? fileName.toLowerCase() : "";
+      const lowerMime = typeof mimeType === "string" ? mimeType.toLowerCase() : "";
+
+      let extractedText = typeof text === "string" ? text.trim() : "";
+      let multimodalData: { mimeType: string; data: string } | null = null;
+
+      if (typeof fileBase64 === "string" && fileBase64.length > 0) {
+        const buffer = Buffer.from(fileBase64, "base64");
+        if (
+          lowerName.endsWith(".docx") ||
+          lowerMime.includes("wordprocessingml")
+        ) {
+          const docResult = await mammoth.extractRawText({ buffer });
+          extractedText = (docResult.value || "").trim();
+          if (!extractedText) {
+            res.status(400).json({ error: "Could not extract readable text from this Word document." });
+            return;
+          }
+        } else if (
+          lowerName.endsWith(".pdf") ||
+          lowerMime === "application/pdf" ||
+          lowerMime.startsWith("image/") ||
+          /\.(png|jpe?g|webp|heic|heif)$/.test(lowerName)
+        ) {
+          const resolvedMime =
+            lowerMime && (lowerMime === "application/pdf" || lowerMime.startsWith("image/"))
+              ? lowerMime
+              : lowerName.endsWith(".pdf")
+              ? "application/pdf"
+              : lowerName.endsWith(".png")
+              ? "image/png"
+              : lowerName.endsWith(".webp")
+              ? "image/webp"
+              : "image/jpeg";
+          multimodalData = { mimeType: resolvedMime, data: fileBase64 };
+        } else {
+          extractedText = buffer.toString("utf8").replace(/\u0000/g, "").trim();
+        }
+      }
+
+      if (!extractedText && !multimodalData) {
+        res.status(400).json({ error: "No readable document content or text was provided." });
+        return;
+      }
+
+      const ethiopicRule =
+        safeSource === "am" || safeTarget === "am" || safeSource === "ti" || safeTarget === "ti"
+          ? "\nUse authentic, standard Ethiopic/Ge'ez Fidel script (ፊደል) with accurate grammar and terminology."
+          : "";
+
+      if (multimodalData) {
+        const srcDesc = sourceObj
+          ? `written in ${sourceObj.name} (${sourceObj.nativeName})`
+          : "written in any language (auto-detect)";
+        const callMm = (model: string, level: ThinkingLevel) =>
+          ai.models.generateContent({
+            model,
+            contents: {
+              parts: [
+                { inlineData: multimodalData! },
+                {
+                  text: `Read EVERY single page, heading, paragraph, table row, and bullet in this document/image (${srcDesc}).
+Translate the ENTIRE document completely, faithfully, and naturally into ${targetObj.name} (${targetObj.nativeName}) with zero omissions or summarization.${ethiopicRule}
+Return strict JSON with detectedLanguage, sourceText (full extracted original text preserving paragraphs), and translatedText (full translated report preserving paragraphs).`,
+                },
+              ],
+            },
+            config: {
+              thinkingConfig: { thinkingLevel: level },
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  detectedLanguage: { type: Type.STRING },
+                  sourceText: { type: Type.STRING },
+                  translatedText: { type: Type.STRING },
+                },
+                required: ["detectedLanguage", "sourceText", "translatedText"],
+              },
+            },
+          });
+
+        let mmResp;
+        try {
+          mmResp = await callMm("gemini-4-hydrogen", ThinkingLevel.LOW);
+        } catch (err) {
+          if (isRetryableQuotaOrLoadError(err)) {
+            mmResp = await callMm("gemini-3.1-flash-lite", ThinkingLevel.MINIMAL);
+          } else {
+            throw err;
+          }
+        }
+        const parsed = JSON.parse((mmResp.text ?? "{}").trim()) as {
+          detectedLanguage?: string;
+          sourceText?: string;
+          translatedText?: string;
+        };
+        const outTranslated = (parsed.translatedText ?? "").trim();
+        const sections = splitReportIntoReadableSections(outTranslated);
+        res.json({
+          detectedLanguage: parsed.detectedLanguage || (sourceObj?.name ?? "Auto"),
+          sourceText: (parsed.sourceText ?? "").trim(),
+          translatedText: outTranslated,
+          sections,
+        });
+        return;
+      }
+
+      // Chunk long plain/docx reports into <= 4,500-char paragraph batches so zero sentences are dropped
+      const paragraphs = extractedText
+        .split(/\n{2,}/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const chunks: string[] = [];
+      let currentChunk = "";
+      for (const p of paragraphs) {
+        if (currentChunk && currentChunk.length + p.length + 2 > 4500) {
+          chunks.push(currentChunk);
+          currentChunk = p;
+        } else {
+          currentChunk = currentChunk ? `${currentChunk}\n\n${p}` : p;
+        }
+      }
+      if (currentChunk) chunks.push(currentChunk);
+      if (chunks.length === 0) chunks.push(extractedText);
+
+      const srcHint = sourceObj
+        ? `from ${sourceObj.name} (${sourceObj.nativeName})`
+        : "(auto-detecting source language)";
+
+      const translateBatch = async (batchText: string): Promise<string> => {
+        const prompt = `Translate this entire document section completely and accurately ${srcHint} into ${targetObj.name} (${targetObj.nativeName}), preserving every paragraph, heading, bullet point, and number with zero omissions.${ethiopicRule}
+Return ONLY the translated text preserving paragraph breaks.
+
+Document text:
+"""
+${batchText}
+"""`;
+        try {
+          const resp = await ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents: prompt,
+            config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
+          });
+          return (resp.text ?? "").trim();
+        } catch (err) {
+          if (isRetryableQuotaOrLoadError(err)) {
+            await new Promise((r) => setTimeout(r, 450));
+            const resp2 = await ai.models.generateContent({
+              model: "gemini-3.1-flash-lite",
+              contents: prompt,
+              config: { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } },
+            });
+            return (resp2.text ?? "").trim();
+          }
+          throw err;
+        }
+      };
+
+      const translatedChunks: string[] = new Array(chunks.length);
+      for (let i = 0; i < chunks.length; i += 2) {
+        const pair = chunks.slice(i, i + 2);
+        const results = await Promise.all(pair.map((c) => translateBatch(c)));
+        for (let j = 0; j < results.length; j++) {
+          translatedChunks[i + j] = results[j];
+        }
+      }
+
+      const fullTranslated = translatedChunks.filter(Boolean).join("\n\n").trim();
+      const sections = splitReportIntoReadableSections(fullTranslated);
+
+      res.json({
+        detectedLanguage: sourceObj?.name ?? "Auto",
+        sourceText: extractedText,
+        translatedText: fullTranslated,
+        sections,
+      });
+    } catch (err) {
+      const formatted = formatApiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -1266,6 +1743,8 @@ async function startServer() {
     const sourceCode = sanitizeLangCode(url.searchParams.get("sourceLang") || "auto", true);
     const voiceName = sanitizeVoice(url.searchParams.get("voiceName") || "Zephyr");
     const bidirectionalParam = url.searchParams.get("bidirectional") === "true";
+    const lowBandwidth = url.searchParams.get("lowBandwidth") === "true";
+    const whisperBoost = url.searchParams.get("whisperBoost") !== "false";
 
     const targetLang = getLanguageByCode(targetCode);
     const sourceLang = sourceCode === "auto" ? null : getLanguageByCode(sourceCode);
@@ -1273,22 +1752,32 @@ async function startServer() {
       bidirectionalParam && sourceLang !== null && sourceLang.code !== targetLang.code;
     const sourceLangLabel = sourceLang ? sourceLang.name : "any spoken language";
 
+    const usePrecisionEngineInitially =
+      isBidirectional ||
+      lowBandwidth ||
+      sourceCode === "auto" ||
+      PRECISION_VOICE_LANGS.has(sourceCode) ||
+      PRECISION_VOICE_LANGS.has(targetCode) ||
+      !targetLang.liveTranslateSupported;
+
     let activeSession: LiveSessionHandle | null = null;
     let isClosed = false;
-    let mode: "gemini_live" | "vad_stream" = "gemini_live";
+    let mode: "gemini_live" | "vad_stream" = usePrecisionEngineInitially
+      ? "vad_stream"
+      : "gemini_live";
     let usedFallbackModel = false;
     let resumeHandle: string | undefined;
     let sessionGeneration = 0;
     let reconnectAttempts = 0;
     let statusSent = false;
 
-    // Continuous VAD state (unlimited fallback when BidiGenerateContent is unavailable/exhausted)
+    // Continuous Precision Streaming VAD state
     let vadPreRoll: Buffer[] = [];
     let vadChunks: Buffer[] = [];
     let vadSpeechActive = false;
     let vadSpeechStartAt = 0;
     let vadLastVoiceAt = 0;
-    let vadNoiseFloor = 0.0025;
+    let vadNoiseFloor = 0.0022;
     const vadQueue: Buffer[][] = [];
     let vadDraining = false;
 
@@ -1301,6 +1790,7 @@ async function startServer() {
           connected: true,
           mode: activeMode,
           targetLang: targetLang.code,
+          sampleRate: lowBandwidth ? 12000 : 24000,
         })
       );
     };
@@ -1317,31 +1807,85 @@ async function startServer() {
           }
           const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
           try {
-            const result = await transcribeAndTranslate({
+            const result = await transcribeAndTranslateStream({
               audioBase64: wavBase64,
               mimeType: "audio/wav",
               sourceLangCode: sourceCode,
               targetLangCode: targetLang.code,
               bidirectional: isBidirectional,
+              onPartial: (partial) => {
+                if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
+                if (partial.sourceTranscript) {
+                  clientWs.send(
+                    JSON.stringify({
+                      type: "inputTranscript",
+                      text: partial.sourceTranscript,
+                      replace: true,
+                    })
+                  );
+                }
+                if (partial.translatedText) {
+                  clientWs.send(
+                    JSON.stringify({
+                      type: "outputTranscript",
+                      text: partial.translatedText,
+                      replace: true,
+                    })
+                  );
+                }
+              },
             });
             if (isClosed || clientWs.readyState !== WebSocket.OPEN) break;
             if (!result.sourceTranscript && !result.translatedText) continue;
 
             if (result.sourceTranscript) {
               clientWs.send(
-                JSON.stringify({ type: "inputTranscript", text: result.sourceTranscript })
+                JSON.stringify({
+                  type: "inputTranscript",
+                  text: result.sourceTranscript,
+                  replace: true,
+                })
               );
             }
             if (result.translatedText) {
               clientWs.send(
-                JSON.stringify({ type: "outputTranscript", text: result.translatedText })
+                JSON.stringify({
+                  type: "outputTranscript",
+                  text: result.translatedText,
+                  replace: true,
+                })
               );
+              let leftoverLow: Buffer | null = null;
               const streamed = await synthesizeSpeechStream(
                 result.translatedText,
                 voiceName,
-                (pcmBase64) => {
-                  if (!isClosed && clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(JSON.stringify({ type: "audio", data: pcmBase64 }));
+                (pcm24kBuf) => {
+                  if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
+                  if (lowBandwidth) {
+                    const combined = leftoverLow
+                      ? Buffer.concat([leftoverLow, pcm24kBuf])
+                      : pcm24kBuf;
+                    const usableBytes = Math.floor(combined.length / 4) * 4;
+                    leftoverLow =
+                      combined.length > usableBytes ? combined.subarray(usableBytes) : null;
+                    if (usableBytes >= 4) {
+                      const down12k = downsample24kTo12kPcm16(combined.subarray(0, usableBytes));
+                      clientWs.send(
+                        JSON.stringify({
+                          type: "audio",
+                          sampleRate: 12000,
+                          data: down12k.toString("base64"),
+                        })
+                      );
+                    }
+                  } else {
+                    clientWs.send(
+                      JSON.stringify({
+                        type: "audio",
+                        sampleRate: 24000,
+                        data: pcm24kBuf.toString("base64"),
+                      })
+                    );
                   }
                 }
               ).catch(() => false);
@@ -1357,7 +1901,13 @@ async function startServer() {
               }
             }
             if (!isClosed && clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: "turnComplete" }));
+              clientWs.send(
+                JSON.stringify({
+                  type: "turnComplete",
+                  resolvedSourceLang: result.resolvedSourceLang,
+                  resolvedTargetLang: result.resolvedTargetLang,
+                })
+              );
             }
           } catch (err) {
             const formatted = formatApiError(err);
@@ -1377,7 +1927,6 @@ async function startServer() {
                   message: formatted.message,
                 })
               );
-              // Brief pause before next loop so bursty RPM resets cleanly without dropping mic
               await new Promise((r) => setTimeout(r, 900));
             }
           }
@@ -1392,17 +1941,19 @@ async function startServer() {
       if (pcmBuf.length < 4) return;
       const rms = computePcm16Rms(pcmBuf);
       const now = Date.now();
-      const SPEECH_THRESHOLD = Math.max(0.0042, vadNoiseFloor * 2.2);
-      const SILENCE_HANG_MS = 520;
+      const minFloor = whisperBoost ? 0.0024 : 0.0040;
+      const multiplier = whisperBoost ? 1.85 : 2.15;
+      const SPEECH_THRESHOLD = Math.max(minFloor, vadNoiseFloor * multiplier);
+      const SILENCE_HANG_MS = 450;
       const MAX_UTTERANCE_MS = 6500;
-      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.3; // 300ms avoids cutting short words/syllables
+      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.24; // 240ms preserves crisp short words
 
       if (!vadSpeechActive) {
         if (rms < SPEECH_THRESHOLD) {
           vadNoiseFloor = vadNoiseFloor * 0.92 + rms * 0.08;
         }
         vadPreRoll.push(pcmBuf);
-        if (vadPreRoll.length > 4) vadPreRoll.shift();
+        if (vadPreRoll.length > 5) vadPreRoll.shift();
         if (rms >= SPEECH_THRESHOLD) {
           vadSpeechActive = true;
           vadSpeechStartAt = now;
@@ -1432,8 +1983,20 @@ async function startServer() {
       }
     };
 
+    const flushVad = () => {
+      if (!vadSpeechActive || vadChunks.length === 0) return;
+      const totalBytes = vadChunks.reduce((acc, b) => acc + b.length, 0);
+      const utterance = vadChunks;
+      vadChunks = [];
+      vadSpeechActive = false;
+      if (totalBytes >= 16000 * 2 * 0.24) {
+        vadQueue.push(utterance);
+        void drainVadQueue();
+      }
+    };
+
     const activateContinuousVadFallback = () => {
-      if (isClosed || mode === "vad_stream") return;
+      if (isClosed) return;
       mode = "vad_stream";
       try {
         activeSession?.close();
@@ -1441,7 +2004,7 @@ async function startServer() {
         // ignore
       }
       activeSession = null;
-      sendConnectedStatus("continuous-vad");
+      sendConnectedStatus("precision-stream");
     };
 
     // Register client message & close listeners immediately to prevent missing early frames
@@ -1457,6 +2020,8 @@ async function startServer() {
               audio: { data: parsed.data, mimeType: "audio/pcm;rate=16000" },
             });
           }
+        } else if (parsed.type === "vad_flush" && mode === "vad_stream") {
+          flushVad();
         }
       } catch {
         // Ignore malformed frames
@@ -1634,6 +2199,11 @@ async function startServer() {
       }
     };
 
+    if (usePrecisionEngineInitially) {
+      sendConnectedStatus("precision-stream");
+      return;
+    }
+
     const useTranslateInitially = !isBidirectional && targetLang.liveTranslateSupported;
     try {
       activeSession = await connectLiveSession(useTranslateInitially, true);
@@ -1675,6 +2245,8 @@ async function startServer() {
     const name = (url.searchParams.get("name") || "Guest").slice(0, 40).trim() || "Guest";
     const langCode = sanitizeLangCode(url.searchParams.get("lang") || "en", false);
     const voiceName = sanitizeVoice(url.searchParams.get("voice") || "Zephyr");
+    const lowBandwidth = url.searchParams.get("lowBandwidth") === "true";
+    const whisperBoost = url.searchParams.get("whisperBoost") !== "false";
 
     if (!/^[A-Z0-9]{4,10}$/.test(roomCode) || !participantId) {
       ws.send(JSON.stringify({ type: "error", message: "Invalid room or participant ID." }));
@@ -1704,6 +2276,8 @@ async function startServer() {
       langCode,
       voiceName,
       liveCallActive: false,
+      lowBandwidth,
+      whisperBoost,
       liveTranslators: new Map(),
       ws,
       joinedAt: Date.now(),
@@ -1739,6 +2313,8 @@ async function startServer() {
           langCode?: string;
           voiceName?: string;
           name?: string;
+          lowBandwidth?: boolean;
+          whisperBoost?: boolean;
           messageId?: string;
           audioBase64?: string;
           mimeType?: string;
@@ -1751,11 +2327,15 @@ async function startServer() {
           if (current) {
             const langChanged =
               msg.langCode && sanitizeLangCode(msg.langCode, false) !== current.langCode;
+            const bwChanged =
+              typeof msg.lowBandwidth === "boolean" && msg.lowBandwidth !== current.lowBandwidth;
             if (msg.langCode) current.langCode = sanitizeLangCode(msg.langCode, false);
             if (msg.voiceName) current.voiceName = sanitizeVoice(msg.voiceName);
             if (msg.name) current.name = msg.name.slice(0, 40).trim() || current.name;
+            if (typeof msg.lowBandwidth === "boolean") current.lowBandwidth = msg.lowBandwidth;
+            if (typeof msg.whisperBoost === "boolean") current.whisperBoost = msg.whisperBoost;
             broadcastRoomPresence(room!);
-            if (langChanged) {
+            if (langChanged || bwChanged) {
               closeParticipantTranslators(current);
               reconcileAllRoomTranslators(room!);
             }
@@ -1799,6 +2379,26 @@ async function startServer() {
                 ch.session.sendRealtimeInput({
                   audio: { data: msg.data, mimeType: "audio/pcm;rate=16000" },
                 });
+              }
+            }
+          }
+          return;
+        }
+
+        if (msg.type === "room:live_flush") {
+          const current = room!.participants.get(participantId);
+          if (current && current.liveCallActive) {
+            for (const ch of current.liveTranslators.values()) {
+              if (ch.closed || ch.mode !== "vad_stream") continue;
+              if (ch.vadSpeechActive && ch.vadChunks.length > 0) {
+                const totalBytes = ch.vadChunks.reduce((acc, b) => acc + b.length, 0);
+                const utterance = ch.vadChunks;
+                ch.vadChunks = [];
+                ch.vadSpeechActive = false;
+                if (totalBytes >= 16000 * 2 * 0.24) {
+                  ch.vadQueue.push(utterance);
+                  void drainRoomChannelVadQueue(room!, current, ch);
+                }
               }
             }
           }

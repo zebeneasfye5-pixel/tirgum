@@ -16,12 +16,15 @@ import {
   Share2,
   Ear,
   Trash2,
+  Gauge,
 } from "lucide-react";
 import { UI_COPY, UiLang } from "../data/i18n";
 import { getLanguageByCode, VOICE_PROFILES, VoiceId } from "../data/languages";
 import {
   BoostedMicPipeline,
+  computeFloat32Rms,
   createBoostedMicPipeline,
+  detectSlowNetwork,
   downsampleTo16k,
   float32ToPcm16Base64,
   GaplessPcmPlayer,
@@ -61,9 +64,16 @@ interface LiveCaption {
 interface RemoteRoomViewProps {
   uiLang: UiLang;
   initialRoomCode?: string;
+  lowBandwidth?: boolean;
+  onLowBandwidthChange?: (enabled: boolean) => void;
 }
 
-export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewProps) {
+export function RemoteRoomView({
+  uiLang,
+  initialRoomCode = "",
+  lowBandwidth: controlledLowBw,
+  onLowBandwidthChange,
+}: RemoteRoomViewProps) {
   const t = UI_COPY[uiLang];
 
   const [participantId] = useState(() => {
@@ -98,6 +108,17 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
   const [whisperBoost, setWhisperBoost] = useState<boolean>(() => {
     return localStorage.getItem("lissan_whisper_boost") !== "false";
   });
+  const [localLowBw, setLocalLowBw] = useState<boolean>(() => {
+    const saved = localStorage.getItem("lissan_low_network");
+    if (saved === "true" || saved === "false") return saved === "true";
+    return detectSlowNetwork();
+  });
+  const lowBandwidth = controlledLowBw ?? localLowBw;
+  const setLowBandwidth = (next: boolean) => {
+    setLocalLowBw(next);
+    localStorage.setItem("lissan_low_network", String(next));
+    onLowBandwidthChange?.(next);
+  };
   const [liveCaption, setLiveCaption] = useState<LiveCaption | null>(null);
 
   const [isSendingText, setIsSendingText] = useState(false);
@@ -152,7 +173,20 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
     whisperBoostRef.current = whisperBoost;
     localStorage.setItem("lissan_whisper_boost", String(whisperBoost));
     micPipelineRef.current?.setBoost(whisperBoost);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({ type: "participant:update", whisperBoost })
+      );
+    }
   }, [whisperBoost]);
+
+  useEffect(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({ type: "participant:update", lowBandwidth })
+      );
+    }
+  }, [lowBandwidth]);
 
   useEffect(() => {
     liveCallActiveRef.current = liveCallActive;
@@ -239,6 +273,10 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
       setLiveCallActive(true);
       setMicMuted(false);
 
+      const preRollQueue: string[] = [];
+      let speechGateActive = false;
+      let hangoverFrames = 0;
+
       pipeline.processor.onaudioprocess = (e) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
         if (pipeline.ctx.state === "suspended") {
@@ -253,8 +291,31 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
         }
         const raw = e.inputBuffer.getChannelData(0);
         const pcm16k = downsampleTo16k(raw, pipeline.ctx.sampleRate);
+        const rms = computeFloat32Rms(pcm16k);
         const base64 = float32ToPcm16Base64(pcm16k);
-        wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: base64 }));
+        const gateThreshold = whisperBoostRef.current ? 0.0022 : 0.0038;
+
+        if (rms >= gateThreshold) {
+          if (!speechGateActive) {
+            speechGateActive = true;
+            while (preRollQueue.length > 0) {
+              const pre = preRollQueue.shift()!;
+              wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: pre }));
+            }
+          }
+          hangoverFrames = 7; // ~450ms trailing hangover
+          wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: base64 }));
+        } else if (speechGateActive) {
+          wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: base64 }));
+          hangoverFrames -= 1;
+          if (hangoverFrames <= 0) {
+            speechGateActive = false;
+            wsRef.current.send(JSON.stringify({ type: "room:live_flush" }));
+          }
+        } else {
+          preRollQueue.push(base64);
+          if (preRollQueue.length > 5) preRollQueue.shift();
+        }
       };
     } catch {
       setErrorMsg(t.errorMicDenied);
@@ -275,6 +336,8 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
         name: name.trim() || "Guest",
         lang: myLangCode,
         voice: myVoice,
+        lowBandwidth: String(lowBandwidth),
+        whisperBoost: String(whisperBoostRef.current),
       });
       const ws = new WebSocket(`${protocol}//${window.location.host}/ws/room?${params.toString()}`);
       wsRef.current = ws;
@@ -312,7 +375,7 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
           } else if (data.type === "room:live_audio_out" && data.data) {
             lastIncomingAudioAtRef.current = Date.now();
             const player = ensureOutputPlayer();
-            player.enqueuePcm24kBase64(data.data);
+            player.enqueuePcmBase64(data.data, Number(data.sampleRate) || 24000);
           } else if (data.type === "room:live_audio_wav" && data.data) {
             lastIncomingAudioAtRef.current = Date.now();
             const player = ensureOutputPlayer();
@@ -852,6 +915,19 @@ export function RemoteRoomView({ uiLang, initialRoomCode = "" }: RemoteRoomViewP
                   type="checkbox"
                   checked={echoGuard}
                   onChange={(e) => setEchoGuard(e.target.checked)}
+                  className="h-4 w-4 accent-blue-700"
+                />
+              </label>
+
+              <label className="flex cursor-pointer items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <Gauge className="h-4 w-4 text-blue-700" />
+                  <span>{t.lowNetworkShort}</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={lowBandwidth}
+                  onChange={(e) => setLowBandwidth(e.target.checked)}
                   className="h-4 w-4 accent-blue-700"
                 />
               </label>

@@ -52,6 +52,41 @@ export function base64Pcm16ToFloat32(base64: string): Float32Array {
   return float32;
 }
 
+export function computeFloat32Rms(samples: Float32Array): number {
+  if (samples.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    sumSq += s * s;
+  }
+  return Math.sqrt(sumSq / samples.length);
+}
+
+export function detectSlowNetwork(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const nav = navigator as Navigator & {
+    connection?: {
+      effectiveType?: string;
+      saveData?: boolean;
+      downlink?: number;
+    };
+  };
+  const conn = nav.connection;
+  if (!conn) return false;
+  if (conn.saveData) return true;
+  if (
+    conn.effectiveType === "slow-2g" ||
+    conn.effectiveType === "2g" ||
+    conn.effectiveType === "3g"
+  ) {
+    return true;
+  }
+  if (typeof conn.downlink === "number" && conn.downlink > 0 && conn.downlink < 1.5) {
+    return true;
+  }
+  return false;
+}
+
 export async function createInputAudioContext(): Promise<AudioContext> {
   let ctx: AudioContext;
   try {
@@ -75,9 +110,10 @@ export interface BoostedMicPipeline {
 
 /**
  * Studio voice pre-conditioning chain:
- * High-pass filter (85Hz) strips room rumble/wind, followed by high-sensitivity
- * pre-gain + DynamicsCompressor + makeup gain so whispers and distant voices
- * are lifted clearly without clipping loud speech.
+ * - 75Hz high-pass filter removes low room rumble & breath pops
+ * - 2400Hz peaking presence EQ (+4.5dB) keeps soft & low-tone consonants crisp
+ * - 2.6x pre-gain + 4.5:1 soft-knee compressor + 1.35x makeup gain lifts quiet/distant speech
+ * - 1024-sample capture blocks (~64ms @ 16kHz) minimize streaming latency
  */
 export async function createBoostedMicPipeline(
   stream: MediaStream,
@@ -88,35 +124,42 @@ export async function createBoostedMicPipeline(
 
   const highpass = ctx.createBiquadFilter();
   highpass.type = "highpass";
-  highpass.frequency.value = 85;
+  highpass.frequency.value = 75;
   highpass.Q.value = 0.7;
+
+  const presenceEq = ctx.createBiquadFilter();
+  presenceEq.type = "peaking";
+  presenceEq.frequency.value = 2400;
+  presenceEq.Q.value = 1.0;
 
   const preGain = ctx.createGain();
   const compressor = ctx.createDynamicsCompressor();
-  compressor.knee.value = 18;
+  compressor.knee.value = 16;
   compressor.attack.value = 0.008;
-  compressor.release.value = 0.18;
+  compressor.release.value = 0.16;
   const makeupGain = ctx.createGain();
 
   const applyBoost = (enabled: boolean) => {
     const now = ctx.currentTime;
-    preGain.gain.setTargetAtTime(enabled ? 2.1 : 1.0, now, 0.03);
-    compressor.threshold.setTargetAtTime(enabled ? -32 : -6, now, 0.03);
-    compressor.ratio.setTargetAtTime(enabled ? 4 : 1.5, now, 0.03);
-    makeupGain.gain.setTargetAtTime(enabled ? 1.25 : 1.0, now, 0.03);
+    presenceEq.gain.setTargetAtTime(enabled ? 4.5 : 0, now, 0.03);
+    preGain.gain.setTargetAtTime(enabled ? 2.6 : 1.0, now, 0.03);
+    compressor.threshold.setTargetAtTime(enabled ? -36 : -6, now, 0.03);
+    compressor.ratio.setTargetAtTime(enabled ? 4.5 : 1.5, now, 0.03);
+    makeupGain.gain.setTargetAtTime(enabled ? 1.35 : 1.0, now, 0.03);
   };
   applyBoost(boostEnabled);
 
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 256;
 
-  // 2048-sample frames halve capture latency vs 4096 while keeping WS smooth
-  const processor = ctx.createScriptProcessor(2048, 1, 1);
+  // 1024-sample frames (~64ms) give sub-100ms capture latency with crisp voice frames
+  const processor = ctx.createScriptProcessor(1024, 1, 1);
   const silentGain = ctx.createGain();
   silentGain.gain.value = 0;
 
   source.connect(highpass);
-  highpass.connect(preGain);
+  highpass.connect(presenceEq);
+  presenceEq.connect(preGain);
   preGain.connect(compressor);
   compressor.connect(makeupGain);
   makeupGain.connect(analyser);
@@ -137,6 +180,7 @@ export async function createBoostedMicPipeline(
         makeupGain.disconnect();
         compressor.disconnect();
         preGain.disconnect();
+        presenceEq.disconnect();
         highpass.disconnect();
         source.disconnect();
         silentGain.disconnect();
@@ -187,7 +231,30 @@ export class GaplessPcmPlayer {
     }
   }
 
-  public enqueuePcm24kBytes(bytes: Uint8Array) {
+  public getRemainingMs(): number {
+    if (!this.ctx) return 0;
+    return Math.max(0, (this.nextStartTime - this.ctx.currentTime) * 1000);
+  }
+
+  public waitUntilDrained(abortSignal?: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (abortSignal?.aborted) {
+          resolve();
+          return;
+        }
+        if (this.activeSources.size === 0 && this.getRemainingMs() <= 20) {
+          resolve();
+          return;
+        }
+        const waitMs = Math.min(250, Math.max(40, this.getRemainingMs()));
+        setTimeout(check, waitMs);
+      };
+      check();
+    });
+  }
+
+  public enqueuePcmBytes(bytes: Uint8Array, sampleRate = 24000, playbackRate = 1.0) {
     const sampleCount = Math.floor(bytes.byteLength / 2);
     if (sampleCount === 0) return;
     const { ctx, analyser } = this.ensureContext();
@@ -197,11 +264,12 @@ export class GaplessPcmPlayer {
       samples[i] = view.getInt16(i * 2, true) / 32768;
     }
 
-    const buffer = ctx.createBuffer(1, samples.length, 24000);
+    const buffer = ctx.createBuffer(1, samples.length, sampleRate);
     buffer.getChannelData(0).set(samples);
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
+    source.playbackRate.value = playbackRate;
     source.connect(analyser);
 
     const now = ctx.currentTime;
@@ -210,7 +278,38 @@ export class GaplessPcmPlayer {
     }
 
     source.start(this.nextStartTime);
-    this.nextStartTime += buffer.duration;
+    this.nextStartTime += buffer.duration / Math.max(0.5, playbackRate);
+
+    this.activeSources.add(source);
+    source.onended = () => {
+      this.activeSources.delete(source);
+    };
+  }
+
+  public enqueuePcm24kBytes(bytes: Uint8Array) {
+    this.enqueuePcmBytes(bytes, 24000, 1.0);
+  }
+
+  public enqueuePcmBase64(base64: string, sampleRate = 24000, playbackRate = 1.0) {
+    const { ctx, analyser } = this.ensureContext();
+    const samples = base64Pcm16ToFloat32(base64);
+    if (samples.length === 0) return;
+
+    const buffer = ctx.createBuffer(1, samples.length, sampleRate);
+    buffer.getChannelData(0).set(samples);
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = playbackRate;
+    source.connect(analyser);
+
+    const now = ctx.currentTime;
+    if (this.nextStartTime < now + 0.015) {
+      this.nextStartTime = now + 0.025;
+    }
+
+    source.start(this.nextStartTime);
+    this.nextStartTime += buffer.duration / Math.max(0.5, playbackRate);
 
     this.activeSources.add(source);
     source.onended = () => {
@@ -219,29 +318,7 @@ export class GaplessPcmPlayer {
   }
 
   public enqueuePcm24kBase64(base64: string) {
-    const { ctx, analyser } = this.ensureContext();
-    const samples = base64Pcm16ToFloat32(base64);
-    if (samples.length === 0) return;
-
-    const buffer = ctx.createBuffer(1, samples.length, 24000);
-    buffer.getChannelData(0).set(samples);
-
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(analyser);
-
-    const now = ctx.currentTime;
-    if (this.nextStartTime < now + 0.015) {
-      this.nextStartTime = now + 0.025;
-    }
-
-    source.start(this.nextStartTime);
-    this.nextStartTime += buffer.duration;
-
-    this.activeSources.add(source);
-    source.onended = () => {
-      this.activeSources.delete(source);
-    };
+    this.enqueuePcmBase64(base64, 24000, 1.0);
   }
 
   public async enqueueWavBase64(base64Wav: string) {
