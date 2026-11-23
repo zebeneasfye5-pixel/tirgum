@@ -80,17 +80,27 @@ function isFatalAuthError(msg: string): boolean {
   );
 }
 
-function isRetryableQuotaOrLoadError(err: unknown): boolean {
+function isServerBusyError(err: unknown): boolean {
   const msg = extractErrorMessage(err).toUpperCase();
   return (
     msg.includes("503") ||
     msg.includes("UNAVAILABLE") ||
-    msg.includes("HIGH DEMAND") ||
+    msg.includes("HIGH DEMAND")
+  );
+}
+
+function isRateLimitError(err: unknown): boolean {
+  const msg = extractErrorMessage(err).toUpperCase();
+  return (
     msg.includes("429") ||
     msg.includes("RESOURCE_EXHAUSTED") ||
     msg.includes("RATE_LIMIT") ||
     msg.includes("QUOTA")
   );
+}
+
+function isRetryableQuotaOrLoadError(err: unknown): boolean {
+  return isServerBusyError(err) || isRateLimitError(err);
 }
 
 function formatApiError(err: unknown): { status: number; message: string } {
@@ -137,8 +147,8 @@ function normalizePcm16Buffer(pcmBuffer: Buffer): Buffer {
     if (abs > peak) peak = abs;
   }
 
-  // Never amplify silent room hiss/static (< 420 peak); cap gain at 3.2x so noise stays quiet
-  if (peak < 420 || peak >= 7500) {
+  // Never amplify silent room hiss/static (< 240 peak); cap gain at 3.2x so noise stays quiet
+  if (peak < 240 || peak >= 7500) {
     return pcmBuffer;
   }
 
@@ -165,8 +175,8 @@ function hasValidSpeechEnergy(
   let peakAbs = 0;
   let maxChunkRms = 0;
   let activeFrames = 0;
-  const minRms = Math.max(whisperBoost ? 0.0055 : 0.0095, noiseFloor * 2.2);
-  const minChunkPeak = whisperBoost ? 480 : 850;
+  const minRms = Math.max(whisperBoost ? 0.0035 : 0.0058, noiseFloor * 1.9);
+  const minChunkPeak = whisperBoost ? 260 : 450;
 
   for (const chunk of chunks) {
     totalBytes += chunk.length;
@@ -185,10 +195,10 @@ function hasValidSpeechEnergy(
     }
   }
 
-  if (totalBytes < 16000 * 2 * 0.25) return false;
+  if (totalBytes < 16000 * 2 * 0.18) return false;
   if (peakAbs < minChunkPeak) return false;
   if (maxChunkRms < minRms) return false;
-  if (activeFrames < 2) return false;
+  if (activeFrames < 1) return false;
   return true;
 }
 
@@ -323,7 +333,6 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
       model: modelName,
       contents: { parts },
       config: {
-        temperature: 0,
         thinkingConfig: { thinkingLevel },
         responseMimeType: "application/json",
         responseSchema: {
@@ -358,19 +367,21 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
 
   let response;
   try {
-    response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
+    response = await callModel("gemini-3.1-flash-lite", ThinkingLevel.MINIMAL);
   } catch (err) {
-    if (isRetryableQuotaOrLoadError(err)) {
+    if (isServerBusyError(err)) {
       try {
-        response = await callModel("gemini-3.1-flash-lite", ThinkingLevel.MINIMAL);
+        response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
       } catch (err2) {
-        if (isRetryableQuotaOrLoadError(err2)) {
-          await new Promise((r) => setTimeout(r, 600));
+        if (isServerBusyError(err2)) {
+          await new Promise((r) => setTimeout(r, 350));
           response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
         } else {
           throw err2;
         }
       }
+    } else if (isRateLimitError(err)) {
+      response = await callModel("gemini-4-hydrogen", ThinkingLevel.LOW);
     } else {
       throw err;
     }
@@ -409,19 +420,11 @@ function parseStreamingTaggedOutput(rawText: string): TranslatedTurnResult {
     if (parts[2]) detectedLanguage = parts[2];
   }
 
-  const srcIdx = clean.indexOf("SRC:");
-  const trIdx = clean.indexOf("\nTR:");
-  let sourceTranscript = "";
-  let translatedText = "";
+  const trMatch = clean.match(/(?:^|\n)TR:\s*([\s\S]*?)(?=\nSRC:|$)/);
+  const srcMatch = clean.match(/(?:^|\n)SRC:\s*([\s\S]*?)(?=\nTR:|$)/);
 
-  if (srcIdx !== -1) {
-    const srcStart = srcIdx + 4;
-    const srcEnd = trIdx !== -1 ? trIdx : clean.length;
-    sourceTranscript = clean.slice(srcStart, srcEnd).trim();
-  }
-  if (trIdx !== -1) {
-    translatedText = clean.slice(trIdx + 4).trim();
-  }
+  let sourceTranscript = srcMatch ? srcMatch[1].trim() : "";
+  let translatedText = trMatch ? trMatch[1].trim() : "";
 
   if (sourceTranscript.toUpperCase() === "NONE") sourceTranscript = "";
   if (translatedText.toUpperCase() === "NONE") translatedText = "";
@@ -442,6 +445,7 @@ async function transcribeAndTranslateStream(params: {
   targetLangCode: string;
   bidirectional?: boolean;
   onPartial?: (partial: TranslatedTurnResult) => void;
+  onTranslationComplete?: (translatedText: string, resolvedTargetLang?: string) => void;
 }): Promise<TranslatedTurnResult> {
   const ai = getAiClient();
   const targetLang = getLanguageByCode(params.targetLangCode);
@@ -471,8 +475,8 @@ NEVER guess, hallucinate, or invent words, greetings ("Hello", "Thank you", "ሰ
 If you do NOT clearly hear real human speech, output ONLY: NONE
 Otherwise, output ONLY this exact 3-line format (no markdown, no extra text):
 LANG: <detected BCP-47 source code>|<target BCP-47 code>|<Language English Name>
-SRC: <exact word-for-word transcript>
-TR: <complete natural translation>`;
+TR: <complete natural translation>
+SRC: <exact word-for-word transcript>`;
 
   const parts = [
     {
@@ -484,27 +488,52 @@ TR: <complete natural translation>`;
     { text: promptText },
   ];
 
-  try {
+  const runStreamModel = async (
+    modelName: string,
+    thinkingLevel: ThinkingLevel
+  ): Promise<TranslatedTurnResult> => {
     const stream = await ai.models.generateContentStream({
-      model: "gemini-4-hydrogen",
+      model: modelName,
       contents: { parts },
       config: {
-        temperature: 0,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        thinkingConfig: { thinkingLevel },
       },
     });
     let fullText = "";
     let lastSrcSent = "";
     let lastTrSent = "";
+    let trFired = false;
+
     for await (const chunk of stream) {
       if (chunk.text) {
         fullText += chunk.text;
+        const parsed = parseStreamingTaggedOutput(fullText);
+
+        // Fire TTS immediately as soon as TR line completes (when SRC: starts arriving)
+        if (
+          !trFired &&
+          params.onTranslationComplete &&
+          fullText.includes("\nSRC:") &&
+          parsed.translatedText.trim().length >= 1 &&
+          !isNoiseOrHallucination(
+            parsed.translatedText,
+            parsed.translatedText
+          )
+        ) {
+          trFired = true;
+          params.onTranslationComplete(
+            parsed.translatedText,
+            parsed.resolvedTargetLang
+          );
+        }
+
         if (params.onPartial) {
-          const parsed = parseStreamingTaggedOutput(fullText);
+          const srcLen = parsed.sourceTranscript.trim().length;
+          const trLen = parsed.translatedText.trim().length;
           const hasValidPartial =
-            parsed.sourceTranscript.trim().length >= 2 &&
+            (srcLen >= 2 || trLen >= 2) &&
             !isNoiseOrHallucination(
-              parsed.sourceTranscript,
+              parsed.sourceTranscript || parsed.translatedText,
               parsed.translatedText || parsed.sourceTranscript
             );
           if (
@@ -519,24 +548,73 @@ TR: <complete natural translation>`;
         }
       }
     }
+
     const finalParsed = parseStreamingTaggedOutput(fullText);
     if (isNoiseOrHallucination(finalParsed.sourceTranscript, finalParsed.translatedText)) {
       return { sourceTranscript: "", detectedLanguage: "", translatedText: "" };
     }
+    if (!trFired && params.onTranslationComplete && finalParsed.translatedText.trim()) {
+      params.onTranslationComplete(
+        finalParsed.translatedText,
+        finalParsed.resolvedTargetLang
+      );
+    }
     return finalParsed;
+  };
+
+  try {
+    return await runStreamModel("gemini-3.1-flash-lite", ThinkingLevel.MINIMAL);
   } catch (err) {
-    if (isRetryableQuotaOrLoadError(err)) {
-      const fallback = await transcribeAndTranslate({
-        audioBase64: params.audioBase64,
-        mimeType: params.mimeType,
-        sourceLangCode: params.sourceLangCode,
-        targetLangCode: params.targetLangCode,
-        bidirectional: params.bidirectional,
-      });
-      if (params.onPartial && fallback.sourceTranscript && fallback.translatedText) {
-        params.onPartial(fallback);
+    if (isServerBusyError(err)) {
+      try {
+        return await runStreamModel("gemini-4-hydrogen", ThinkingLevel.LOW);
+      } catch (err2) {
+        if (isServerBusyError(err2)) {
+          // Dedicated STT model fallback when both general multimodal models see 503 load
+          const sttResp = await ai.models.generateContent({
+            model: "gemini-3.5-transcribe",
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: params.mimeType || "audio/wav",
+                    data: params.audioBase64,
+                  },
+                },
+                {
+                  text: `Transcribe only clearly audible human speech word-for-word in its native script. Output empty string if only noise or silence.`,
+                },
+              ],
+            },
+          });
+          const transcript = (sttResp.text ?? "").trim();
+          if (!transcript || isNoiseOrHallucination(transcript, transcript)) {
+            return { sourceTranscript: "", detectedLanguage: "", translatedText: "" };
+          }
+          const translated = await translateTextOnly({
+            text: transcript,
+            sourceLangName: sourceLang ? sourceLang.name : "spoken",
+            targetLangCode: targetLang.code,
+          });
+          const res: TranslatedTurnResult = {
+            sourceTranscript: transcript,
+            detectedLanguage: sourceLang ? sourceLang.name : "Auto",
+            translatedText: translated,
+            resolvedSourceLang: sourceLang?.code,
+            resolvedTargetLang: targetLang.code,
+          };
+          if (params.onPartial) params.onPartial(res);
+          if (params.onTranslationComplete && translated) {
+            params.onTranslationComplete(translated, targetLang.code);
+          }
+          return res;
+        }
+        throw err2;
       }
-      return fallback;
+    }
+    if (isRateLimitError(err)) {
+      // Single non-amplifying hop to alternate model bucket without multi-step generateContent storm
+      return await runStreamModel("gemini-4-hydrogen", ThinkingLevel.LOW);
     }
     throw err;
   }
@@ -553,20 +631,20 @@ async function translateTextOnly(params: {
   let response;
   try {
     response = await ai.models.generateContent({
-      model: "gemini-4-hydrogen",
+      model: "gemini-3.1-flash-lite",
       contents: prompt,
       config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
       },
     });
   } catch (err) {
     if (isRetryableQuotaOrLoadError(err)) {
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 250));
       response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite",
+        model: "gemini-4-hydrogen",
         contents: prompt,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
       });
     } else {
@@ -579,6 +657,48 @@ async function translateTextOnly(params: {
 const TTS_STYLE_DIRECTIVE =
   "Crystal-clear, articulate, unhurried simultaneous interpreter voice; pronounce every single word and letter distinctly.";
 
+const ttsModelCooldownUntil = new Map<string, number>();
+
+function isTtsModelCoolingDown(model: string): boolean {
+  const until = ttsModelCooldownUntil.get(model);
+  return typeof until === "number" && Date.now() < until;
+}
+
+function recordTtsModelFailure(model: string, err: unknown): void {
+  const msg = extractErrorMessage(err);
+  if (isRateLimitError(err)) {
+    const isDaily = /PerDay|GenerateRequestsPerDay/i.test(msg);
+    // Skip daily-exhausted free-tier TTS model for 30 minutes (or 60s for RPM) so live turns have zero 429 stalls
+    const cooldownMs = isDaily ? 30 * 60 * 1000 : 60 * 1000;
+    ttsModelCooldownUntil.set(model, Date.now() + cooldownMs);
+  } else if (isServerBusyError(err)) {
+    ttsModelCooldownUntil.set(model, Date.now() + 15 * 1000);
+  }
+}
+
+function pcm24kChunksToWavBase64(chunks: Buffer[]): string | null {
+  if (chunks.length === 0) return null;
+  const pcmData = Buffer.concat(chunks);
+  if (pcmData.length === 0) return null;
+  const header = Buffer.alloc(44);
+  const sampleRate = 24000;
+  const byteRate = sampleRate * 2;
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmData.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcmData.length, 40);
+  return Buffer.concat([header, pcmData]).toString("base64");
+}
+
 function isSchemaFieldError(err: unknown): boolean {
   const msg = extractErrorMessage(err);
   return (
@@ -586,6 +706,104 @@ function isSchemaFieldError(err: unknown): boolean {
     msg.includes("speechMetadata") ||
     msg.includes("speechConfig")
   );
+}
+
+/**
+ * Real-time Live API streaming TTS fallback using gemini-3.8-live.
+ * Ensures crisp 24kHz Gemini voice output even when Free Tier generateContent TTS (10 RPD) hits 429.
+ */
+async function synthesizeViaLiveAudio(
+  text: string,
+  voiceName: string,
+  onPcm24kChunk: (pcm24kBuffer: Buffer) => void
+): Promise<boolean> {
+  const cleaned = text.trim();
+  if (!cleaned) return false;
+  const ai = getAiClient("v1beta");
+  const safeVoice = sanitizeVoice(voiceName);
+
+  const attemptLiveTts = (): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      let settled = false;
+      let emitted = false;
+      let session: LiveSessionHandle | null = null;
+      let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        clearTimeout(hardTimeout);
+        try {
+          session?.close();
+        } catch {
+          // ignore
+        }
+        resolve(ok);
+      };
+
+      const bumpInactivity = () => {
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => finish(emitted), emitted ? 1500 : 3500);
+      };
+
+      const hardTimeout = setTimeout(() => finish(emitted), 9500);
+
+      ai.live
+        .connect({
+          model: "gemini-3.8-live",
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: safeVoice } },
+            },
+            systemInstruction:
+              "You are a pure text-to-speech voice engine. Immediately read aloud ONLY the exact phrase enclosed in <read> tags, verbatim, clearly, and naturally in the phrase's own language. Never translate, answer, or add any extra words.",
+          },
+          callbacks: {
+            onopen: () => {
+              // Wait until text is transmitted in .then() before starting initial wait timer
+            },
+            onmessage: (message: LiveServerMessage) => {
+              if (settled) return;
+              const content = message.serverContent;
+              for (const part of content?.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
+                  emitted = true;
+                  bumpInactivity();
+                  onPcm24kChunk(Buffer.from(part.inlineData.data, "base64"));
+                }
+              }
+              if (content?.turnComplete) {
+                finish(emitted);
+              }
+            },
+            onerror: () => finish(emitted),
+            onclose: () => finish(emitted),
+          },
+        })
+        .then((connected) => {
+          session = connected;
+          if (settled) {
+            try {
+              connected.close();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          bumpInactivity();
+          connected.sendRealtimeInput({
+            text: `<read>${cleaned}</read>`,
+          });
+        })
+        .catch(() => finish(false));
+    });
+
+  const first = await attemptLiveTts();
+  if (first) return true;
+  await new Promise((r) => setTimeout(r, 150));
+  return await attemptLiveTts();
 }
 
 async function synthesizeSpeechWav(text: string, voiceName: string): Promise<string | null> {
@@ -631,19 +849,29 @@ async function synthesizeSpeechWav(text: string, voiceName: string): Promise<str
     }
   };
 
-  let response;
-  try {
-    response = await executeWithFallbacks("gemini-3.8-flash-lite-tts");
-  } catch (err) {
-    if (isRetryableQuotaOrLoadError(err) || isSchemaFieldError(err)) {
-      response = await executeWithFallbacks("gemini-3.8-flash-tts");
-    } else {
-      throw err;
+  for (const model of ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]) {
+    if (isTtsModelCoolingDown(model)) continue;
+    try {
+      const response = await executeWithFallbacks(model);
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) return base64Audio;
+    } catch (err) {
+      recordTtsModelFailure(model, err);
+      if (!isRetryableQuotaOrLoadError(err) && !isSchemaFieldError(err)) {
+        break;
+      }
     }
   }
 
-  const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-  return base64Audio ?? null;
+  // Fallback to Live Audio synthesis so user still hears natural 24kHz Gemini voice even on TTS quota limits
+  const liveChunks: Buffer[] = [];
+  const liveOk = await synthesizeViaLiveAudio(text, safeVoice, (buf) => {
+    liveChunks.push(buf);
+  });
+  if (liveOk) {
+    return pcm24kChunksToWavBase64(liveChunks);
+  }
+  return null;
 }
 
 /**
@@ -711,14 +939,21 @@ async function synthesizeSpeechStream(
     }
   };
 
-  try {
-    return await executeStream("gemini-3.8-flash-lite-tts");
-  } catch (err) {
-    if (isRetryableQuotaOrLoadError(err) || isSchemaFieldError(err)) {
-      return await executeStream("gemini-3.8-flash-tts");
+  for (const model of ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]) {
+    if (isTtsModelCoolingDown(model)) continue;
+    try {
+      const ok = await executeStream(model);
+      if (ok) return true;
+    } catch (err) {
+      recordTtsModelFailure(model, err);
+      if (!isRetryableQuotaOrLoadError(err) && !isSchemaFieldError(err)) {
+        break;
+      }
     }
-    throw err;
   }
+
+  // Fallback directly to gemini-3.8-live WebSocket streaming TTS (no 10 RPD limit, <600ms first audio)
+  return await synthesizeViaLiveAudio(text, safeVoice, onPcm24kChunk);
 }
 
 // ============================================================================
@@ -843,8 +1078,61 @@ async function drainRoomChannelVadQueue(
         continue;
       }
       const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
-      try {
-        const result = await transcribeAndTranslateStream({
+      let ttsPromise: Promise<boolean> | null = null;
+      let ttsTextStarted = "";
+
+      const startRoomEarlyTts = (textToSpeak: string) => {
+        const cleaned = textToSpeak.trim();
+        if (!cleaned || ttsPromise || channel.closed) return;
+        ttsTextStarted = cleaned;
+        let leftoverLow: Buffer | null = null;
+        ttsPromise = synthesizeSpeechStream(cleaned, speaker.voiceName, (pcm24kBuf) => {
+          if (channel.closed) return;
+          const fullPayload = JSON.stringify({
+            type: "room:live_audio_out",
+            speakerId: speaker.id,
+            targetLang: channel.targetLangCode,
+            sampleRate: 24000,
+            data: pcm24kBuf.toString("base64"),
+          });
+          let lowPayload: string | null = null;
+
+          for (const p of room.participants.values()) {
+            if (
+              p.id !== speaker.id &&
+              p.langCode === channel.targetLangCode &&
+              p.ws.readyState === WebSocket.OPEN
+            ) {
+              if (p.lowBandwidth) {
+                if (lowPayload === null) {
+                  const combined = leftoverLow
+                    ? Buffer.concat([leftoverLow, pcm24kBuf])
+                    : pcm24kBuf;
+                  const usableBytes = Math.floor(combined.length / 4) * 4;
+                  leftoverLow =
+                    combined.length > usableBytes ? combined.subarray(usableBytes) : null;
+                  if (usableBytes >= 4) {
+                    const down12k = downsample24kTo12kPcm16(combined.subarray(0, usableBytes));
+                    lowPayload = JSON.stringify({
+                      type: "room:live_audio_out",
+                      speakerId: speaker.id,
+                      targetLang: channel.targetLangCode,
+                      sampleRate: 12000,
+                      data: down12k.toString("base64"),
+                    });
+                  }
+                }
+                if (lowPayload) p.ws.send(lowPayload);
+              } else {
+                p.ws.send(fullPayload);
+              }
+            }
+          }
+        }).catch(() => false);
+      };
+
+      const runRoomTurn = () =>
+        transcribeAndTranslateStream({
           audioBase64: wavBase64,
           mimeType: "audio/wav",
           sourceLangCode: speaker.langCode,
@@ -890,7 +1178,26 @@ async function drainRoomChannelVadQueue(
               }
             }
           },
+          onTranslationComplete: (trText) => {
+            if (!channel.closed) {
+              startRoomEarlyTts(trText);
+            }
+          },
         });
+
+      try {
+        let result: TranslatedTurnResult;
+        try {
+          result = await runRoomTurn();
+        } catch (firstErr) {
+          if (isServerBusyError(firstErr)) {
+            await new Promise((r) => setTimeout(r, 250));
+            result = await runRoomTurn();
+          } else {
+            throw firstErr;
+          }
+        }
+
         if (channel.closed || !result.sourceTranscript || !result.translatedText) {
           continue;
         }
@@ -937,57 +1244,12 @@ async function drainRoomChannelVadQueue(
           }
         }
 
-        // Stream 24kHz (normal) or 12kHz (low-bandwidth) PCM chunks live to listeners
-        let leftoverLow: Buffer | null = null;
-        const streamed = await synthesizeSpeechStream(
-          result.translatedText,
-          speaker.voiceName,
-          (pcm24kBuf) => {
-            if (channel.closed) return;
-            const fullPayload = JSON.stringify({
-              type: "room:live_audio_out",
-              speakerId: speaker.id,
-              targetLang: channel.targetLangCode,
-              sampleRate: 24000,
-              data: pcm24kBuf.toString("base64"),
-            });
-            let lowPayload: string | null = null;
+        if (!ttsPromise) {
+          startRoomEarlyTts(result.translatedText);
+        }
+        const streamed = ttsPromise ? await ttsPromise : false;
 
-            for (const p of room.participants.values()) {
-              if (
-                p.id !== speaker.id &&
-                p.langCode === channel.targetLangCode &&
-                p.ws.readyState === WebSocket.OPEN
-              ) {
-                if (p.lowBandwidth) {
-                  if (lowPayload === null) {
-                    const combined = leftoverLow
-                      ? Buffer.concat([leftoverLow, pcm24kBuf])
-                      : pcm24kBuf;
-                    const usableBytes = Math.floor(combined.length / 4) * 4;
-                    leftoverLow =
-                      combined.length > usableBytes ? combined.subarray(usableBytes) : null;
-                    if (usableBytes >= 4) {
-                      const down12k = downsample24kTo12kPcm16(combined.subarray(0, usableBytes));
-                      lowPayload = JSON.stringify({
-                        type: "room:live_audio_out",
-                        speakerId: speaker.id,
-                        targetLang: channel.targetLangCode,
-                        sampleRate: 12000,
-                        data: down12k.toString("base64"),
-                      });
-                    }
-                  }
-                  if (lowPayload) p.ws.send(lowPayload);
-                } else {
-                  p.ws.send(fullPayload);
-                }
-              }
-            }
-          }
-        ).catch(() => false);
-
-        if (!streamed && !channel.closed) {
+        if (ttsTextStarted && !streamed && !channel.closed) {
           const fallbackPayload = JSON.stringify({
             type: "room:fallback_speak",
             speakerId: speaker.id,
@@ -1023,18 +1285,20 @@ function feedRoomChannelVadFrame(
   if (pcmBuf.length < 4) return;
   const rms = computePcm16Rms(pcmBuf);
   const now = Date.now();
-  const minFloor = speaker.whisperBoost ? 0.0055 : 0.0095;
-  const multiplier = speaker.whisperBoost ? 2.3 : 2.6;
+  const minFloor = speaker.whisperBoost ? 0.0035 : 0.0058;
+  const multiplier = speaker.whisperBoost ? 2.1 : 2.4;
   const SPEECH_THRESHOLD = Math.max(minFloor, channel.vadNoiseFloor * multiplier);
-  const SILENCE_HANG_MS = 450;
-  const MAX_UTTERANCE_MS = 6500;
-  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms sustained voice
+  const SILENCE_HANG_MS = 280;
+  const MAX_UTTERANCE_MS = 3800;
+  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.18;
 
   if (!channel.vadSpeechActive) {
     if (rms < SPEECH_THRESHOLD) {
       channel.vadConfirmCount = 0;
-      const updated = channel.vadNoiseFloor * 0.94 + rms * 0.06;
-      channel.vadNoiseFloor = Math.max(0.003, Math.min(0.045, updated));
+      if (rms < minFloor * 1.6) {
+        const updated = channel.vadNoiseFloor * 0.94 + rms * 0.06;
+        channel.vadNoiseFloor = Math.max(0.002, Math.min(0.035, updated));
+      }
       channel.vadPreRoll.push(pcmBuf);
       if (channel.vadPreRoll.length > 5) channel.vadPreRoll.shift();
     } else {
@@ -1845,6 +2109,7 @@ ${batchText}
     const bidirectionalParam = url.searchParams.get("bidirectional") === "true";
     const lowBandwidth = url.searchParams.get("lowBandwidth") === "true";
     const whisperBoost = url.searchParams.get("whisperBoost") !== "false";
+    const engineParam = url.searchParams.get("engine") || "auto";
 
     const targetLang = getLanguageByCode(targetCode);
     const sourceLang = sourceCode === "auto" ? null : getLanguageByCode(sourceCode);
@@ -1853,12 +2118,16 @@ ${batchText}
     const sourceLangLabel = sourceLang ? sourceLang.name : "any spoken language";
 
     const usePrecisionEngineInitially =
-      isBidirectional ||
-      lowBandwidth ||
-      sourceCode === "auto" ||
-      PRECISION_VOICE_LANGS.has(sourceCode) ||
-      PRECISION_VOICE_LANGS.has(targetCode) ||
-      !targetLang.liveTranslateSupported;
+      engineParam === "vad"
+        ? true
+        : engineParam === "live38" || engineParam === "translate35"
+        ? false
+        : isBidirectional ||
+          lowBandwidth ||
+          sourceCode === "auto" ||
+          PRECISION_VOICE_LANGS.has(sourceCode) ||
+          PRECISION_VOICE_LANGS.has(targetCode) ||
+          !targetLang.liveTranslateSupported;
 
     let activeSession: LiveSessionHandle | null = null;
     let isClosed = false;
@@ -1870,6 +2139,8 @@ ${batchText}
     let sessionGeneration = 0;
     let reconnectAttempts = 0;
     let statusSent = false;
+    let liveInAcc = "";
+    let liveOutAcc = "";
 
     // Continuous Precision Streaming VAD state
     let vadPreRoll: Buffer[] = [];
@@ -1911,8 +2182,47 @@ ${batchText}
           }
           const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
           let emittedPartial = false;
-          try {
-            const result = await transcribeAndTranslateStream({
+          let ttsPromise: Promise<boolean> | null = null;
+          let ttsTextStarted = "";
+
+          const startEarlyTts = (textToSpeak: string) => {
+            const cleaned = textToSpeak.trim();
+            if (!cleaned || ttsPromise) return;
+            ttsTextStarted = cleaned;
+            let leftoverLow: Buffer | null = null;
+            ttsPromise = synthesizeSpeechStream(cleaned, voiceName, (pcm24kBuf) => {
+              if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
+              if (lowBandwidth) {
+                const combined = leftoverLow
+                  ? Buffer.concat([leftoverLow, pcm24kBuf])
+                  : pcm24kBuf;
+                const usableBytes = Math.floor(combined.length / 4) * 4;
+                leftoverLow =
+                  combined.length > usableBytes ? combined.subarray(usableBytes) : null;
+                if (usableBytes >= 4) {
+                  const down12k = downsample24kTo12kPcm16(combined.subarray(0, usableBytes));
+                  clientWs.send(
+                    JSON.stringify({
+                      type: "audio",
+                      sampleRate: 12000,
+                      data: down12k.toString("base64"),
+                    })
+                  );
+                }
+              } else {
+                clientWs.send(
+                  JSON.stringify({
+                    type: "audio",
+                    sampleRate: 24000,
+                    data: pcm24kBuf.toString("base64"),
+                  })
+                );
+              }
+            }).catch(() => false);
+          };
+
+          const processTurnOnce = () =>
+            transcribeAndTranslateStream({
               audioBase64: wavBase64,
               mimeType: "audio/wav",
               sourceLangCode: sourceCode,
@@ -1941,7 +2251,25 @@ ${batchText}
                   );
                 }
               },
+              onTranslationComplete: (trText) => {
+                if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
+                startEarlyTts(trText);
+              },
             });
+
+          try {
+            let result: TranslatedTurnResult;
+            try {
+              result = await processTurnOnce();
+            } catch (firstErr) {
+              if (isServerBusyError(firstErr)) {
+                await new Promise((r) => setTimeout(r, 250));
+                result = await processTurnOnce();
+              } else {
+                throw firstErr;
+              }
+            }
+
             if (isClosed || clientWs.readyState !== WebSocket.OPEN) break;
             if (!result.sourceTranscript && !result.translatedText) {
               if (emittedPartial) {
@@ -1967,42 +2295,11 @@ ${batchText}
                   replace: true,
                 })
               );
-              let leftoverLow: Buffer | null = null;
-              const streamed = await synthesizeSpeechStream(
-                result.translatedText,
-                voiceName,
-                (pcm24kBuf) => {
-                  if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
-                  if (lowBandwidth) {
-                    const combined = leftoverLow
-                      ? Buffer.concat([leftoverLow, pcm24kBuf])
-                      : pcm24kBuf;
-                    const usableBytes = Math.floor(combined.length / 4) * 4;
-                    leftoverLow =
-                      combined.length > usableBytes ? combined.subarray(usableBytes) : null;
-                    if (usableBytes >= 4) {
-                      const down12k = downsample24kTo12kPcm16(combined.subarray(0, usableBytes));
-                      clientWs.send(
-                        JSON.stringify({
-                          type: "audio",
-                          sampleRate: 12000,
-                          data: down12k.toString("base64"),
-                        })
-                      );
-                    }
-                  } else {
-                    clientWs.send(
-                      JSON.stringify({
-                        type: "audio",
-                        sampleRate: 24000,
-                        data: pcm24kBuf.toString("base64"),
-                      })
-                    );
-                  }
-                }
-              ).catch(() => false);
-
-              if (!streamed && !isClosed && clientWs.readyState === WebSocket.OPEN) {
+              if (!ttsPromise) {
+                startEarlyTts(result.translatedText);
+              }
+              const streamed = ttsPromise ? await ttsPromise : false;
+              if (ttsTextStarted && !streamed && !isClosed && clientWs.readyState === WebSocket.OPEN) {
                 clientWs.send(
                   JSON.stringify({
                     type: "fallbackSpeak",
@@ -2032,6 +2329,35 @@ ${batchText}
               (formatted.status === 429 || formatted.status === 503) &&
               clientWs.readyState === WebSocket.OPEN
             ) {
+              // Automatically fail over to persistent Gemini Live WebSocket when generateContent hits 429!
+              if (formatted.status === 429 && mode === "vad_stream" && !isClosed) {
+                try {
+                  mode = "gemini_live";
+                  const useTranslateModel = !isBidirectional && targetLang.liveTranslateSupported;
+                  activeSession = await connectLiveSession(useTranslateModel, true);
+                  sendConnectedStatus(
+                    useTranslateModel ? "gemini-3.5-live-failover" : "gemini-3.8-live-failover"
+                  );
+                  for (const chunk of utterance) {
+                    if (isClosed) break;
+                    activeSession.sendRealtimeInput({
+                      audio: { data: chunk.toString("base64"), mimeType: "audio/pcm;rate=16000" },
+                    });
+                    await new Promise((r) => setTimeout(r, 20));
+                  }
+                  const zeroB64 = Buffer.alloc(2048).toString("base64");
+                  for (let i = 0; i < 10; i++) {
+                    if (isClosed) break;
+                    activeSession.sendRealtimeInput({
+                      audio: { data: zeroB64, mimeType: "audio/pcm;rate=16000" },
+                    });
+                    await new Promise((r) => setTimeout(r, 20));
+                  }
+                  continue;
+                } catch {
+                  mode = "vad_stream";
+                }
+              }
               clientWs.send(
                 JSON.stringify({
                   type: "notice",
@@ -2039,7 +2365,7 @@ ${batchText}
                   message: formatted.message,
                 })
               );
-              await new Promise((r) => setTimeout(r, 900));
+              await new Promise((r) => setTimeout(r, 700));
             }
           }
         }
@@ -2053,18 +2379,20 @@ ${batchText}
       if (pcmBuf.length < 4) return;
       const rms = computePcm16Rms(pcmBuf);
       const now = Date.now();
-      const minFloor = whisperBoost ? 0.0055 : 0.0095;
-      const multiplier = whisperBoost ? 2.3 : 2.6;
+      const minFloor = whisperBoost ? 0.0035 : 0.0058;
+      const multiplier = whisperBoost ? 2.1 : 2.4;
       const SPEECH_THRESHOLD = Math.max(minFloor, vadNoiseFloor * multiplier);
-      const SILENCE_HANG_MS = 450;
-      const MAX_UTTERANCE_MS = 6500;
-      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms sustained voice
+      const SILENCE_HANG_MS = 280;
+      const MAX_UTTERANCE_MS = 3800;
+      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.18;
 
       if (!vadSpeechActive) {
         if (rms < SPEECH_THRESHOLD) {
           vadConfirmCount = 0;
-          const updated = vadNoiseFloor * 0.94 + rms * 0.06;
-          vadNoiseFloor = Math.max(0.003, Math.min(0.045, updated));
+          if (rms < minFloor * 1.6) {
+            const updated = vadNoiseFloor * 0.94 + rms * 0.06;
+            vadNoiseFloor = Math.max(0.002, Math.min(0.035, updated));
+          }
           vadPreRoll.push(pcmBuf);
           if (vadPreRoll.length > 5) vadPreRoll.shift();
         } else {
@@ -2114,7 +2442,7 @@ ${batchText}
       vadSpeechActive = false;
       vadConfirmCount = 0;
       if (
-        totalBytes >= 16000 * 2 * 0.25 &&
+        totalBytes >= 16000 * 2 * 0.18 &&
         hasValidSpeechEnergy(utterance, vadNoiseFloor, whisperBoost)
       ) {
         vadQueue.push(utterance);
@@ -2154,7 +2482,7 @@ ${batchText}
           if (mode === "vad_stream") {
             flushVad();
           } else if (activeSession) {
-            // Feed clean digital zeros (~512ms) so Live VAD finishes turn without ambient noise
+            // Feed clean digital zeros (~512ms) so Live VAD finishes turn promptly without ambient noise
             for (let i = 0; i < 8; i++) {
               activeSession.sendRealtimeInput({
                 audio: { data: DIGITAL_SILENCE_B64, mimeType: "audio/pcm;rate=16000" },
@@ -2244,6 +2572,7 @@ ${batchText}
             }
             const content = message.serverContent;
             if (content?.inputTranscription?.text) {
+              liveInAcc += content.inputTranscription.text;
               clientWs.send(
                 JSON.stringify({
                   type: "inputTranscript",
@@ -2252,6 +2581,7 @@ ${batchText}
               );
             }
             if (content?.outputTranscription?.text) {
+              liveOutAcc += content.outputTranscription.text;
               clientWs.send(
                 JSON.stringify({
                   type: "outputTranscript",
@@ -2261,19 +2591,45 @@ ${batchText}
             }
             for (const part of content?.modelTurn?.parts ?? []) {
               if (part.inlineData?.data) {
-                clientWs.send(
-                  JSON.stringify({
-                    type: "audio",
-                    data: part.inlineData.data,
-                  })
-                );
+                if (lowBandwidth) {
+                  const down = downsample24kTo12kPcm16(Buffer.from(part.inlineData.data, "base64"));
+                  if (down.length > 0) {
+                    clientWs.send(
+                      JSON.stringify({
+                        type: "audio",
+                        sampleRate: 12000,
+                        data: down.toString("base64"),
+                      })
+                    );
+                  }
+                } else {
+                  clientWs.send(
+                    JSON.stringify({
+                      type: "audio",
+                      sampleRate: 24000,
+                      data: part.inlineData.data,
+                    })
+                  );
+                }
               }
             }
             if (content?.interrupted) {
+              liveInAcc = "";
+              liveOutAcc = "";
               clientWs.send(JSON.stringify({ type: "interrupted" }));
             }
             if (content?.turnComplete) {
-              clientWs.send(JSON.stringify({ type: "turnComplete" }));
+              const trimmedIn = liveInAcc.trim();
+              const trimmedOut = liveOutAcc.trim();
+              liveInAcc = "";
+              liveOutAcc = "";
+              if (!trimmedIn && !trimmedOut) {
+                clientWs.send(JSON.stringify({ type: "turnDiscarded" }));
+              } else if (isNoiseOrHallucination(trimmedIn || trimmedOut, trimmedOut || trimmedIn)) {
+                clientWs.send(JSON.stringify({ type: "turnDiscarded" }));
+              } else {
+                clientWs.send(JSON.stringify({ type: "turnComplete" }));
+              }
             }
           },
           onerror: (err: unknown) => {
@@ -2343,7 +2699,12 @@ ${batchText}
       return;
     }
 
-    const useTranslateInitially = !isBidirectional && targetLang.liveTranslateSupported;
+    const useTranslateInitially =
+      engineParam === "translate35"
+        ? true
+        : engineParam === "live38"
+        ? false
+        : !isBidirectional && targetLang.liveTranslateSupported;
     try {
       activeSession = await connectLiveSession(useTranslateInitially, true);
     } catch (err) {
@@ -2547,7 +2908,7 @@ ${batchText}
                 ch.vadChunks = [];
                 ch.vadSpeechActive = false;
                 if (
-                  totalBytes >= 16000 * 2 * 0.25 &&
+                  totalBytes >= 16000 * 2 * 0.18 &&
                   hasValidSpeechEnergy(utterance, ch.vadNoiseFloor, current.whisperBoost)
                 ) {
                   ch.vadQueue.push(utterance);

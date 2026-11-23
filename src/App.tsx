@@ -155,6 +155,7 @@ export default function App() {
   const userStoppedLiveRef = useRef<boolean>(true);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
+  const readoutStageRef = useRef<HTMLDivElement | null>(null);
 
   // Turn recorder refs
   const turnRecorderRef = useRef<MediaRecorder | null>(null);
@@ -228,6 +229,12 @@ export default function App() {
   useEffect(() => {
     targetLangRef.current = targetLang;
   }, [targetLang]);
+
+  useEffect(() => {
+    if (!noticeBanner) return;
+    const timer = setTimeout(() => setNoticeBanner(null), 4500);
+    return () => clearTimeout(timer);
+  }, [noticeBanner]);
 
   const stopLiveSession = useCallback(() => {
     userStoppedLiveRef.current = true;
@@ -331,7 +338,7 @@ export default function App() {
           const rawChannel = e.inputBuffer.getChannelData(0);
           const pcm16k = downsampleTo16k(rawChannel, pipeline.ctx.sampleRate);
           const blockedByEcho =
-            echoGuardRef.current && Boolean(playerRef.current?.isSpeaking(700));
+            echoGuardRef.current && Boolean(playerRef.current?.isSpeaking(350));
           const { sendFrames, flushNow } = speechGate.processFrame(
             pcm16k,
             whisperBoostRef.current,
@@ -489,6 +496,11 @@ export default function App() {
       setInputAnalyser(pipeline.analyser);
 
       openLiveSocket(pipeline);
+      if (window.innerWidth < 1024) {
+        requestAnimationFrame(() => {
+          readoutStageRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        });
+      }
     } catch {
       setErrorBanner(t.errorMicDenied);
       stopLiveSession();
@@ -676,7 +688,7 @@ export default function App() {
         void turnCtxRef.current?.close();
         setInputAnalyser(null);
 
-        const minTurnRms = whisperBoostRef.current ? 0.0065 : 0.01;
+        const minTurnRms = whisperBoostRef.current ? 0.0038 : 0.0062;
         if (blob.size < 400 || turnMaxRmsRef.current < minTurnRms) {
           return;
         }
@@ -1184,6 +1196,112 @@ export default function App() {
                 </div>
               )}
 
+              {/* Prominent High-Contrast Live Dual Readout Stage (always visible without scrolling) */}
+              {(liveStatus !== "idle" ||
+                turnRecording ||
+                turnProcessing ||
+                Boolean(liveInputText) ||
+                Boolean(liveOutputText)) && (
+                <div
+                  ref={readoutStageRef}
+                  className="rounded-2xl border-2 border-slate-800 bg-slate-950 p-5 sm:p-6 text-white shadow-sm"
+                >
+                  <div className="mb-4 flex items-center justify-between border-b border-slate-800 pb-2.5 text-xs font-extrabold uppercase tracking-wider">
+                    <div className="flex items-center gap-2 text-emerald-300">
+                      <span
+                        className={`h-2.5 w-2.5 rounded-full ${
+                          liveStatus === "active" || turnRecording
+                            ? "animate-pulse bg-red-500"
+                            : liveStatus === "connecting" || turnProcessing
+                            ? "animate-pulse bg-amber-400"
+                            : "bg-emerald-400"
+                        }`}
+                      />
+                      <span>
+                        {liveStatus === "active"
+                          ? t.liveConnected
+                          : liveStatus === "connecting"
+                          ? t.connectingLive
+                          : turnRecording
+                          ? t.micActive
+                          : turnProcessing
+                          ? t.translatingAudio
+                          : t.readyState}
+                      </span>
+                    </div>
+                    {liveStatus === "active" && (
+                      <span className="font-mono text-slate-300 tabular-nums">
+                        {formatDuration(liveSeconds)}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+                    <div className="space-y-1.5 border-b border-slate-800 pb-4 md:border-b-0 md:border-r md:pb-0 md:pr-5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-extrabold uppercase tracking-wider text-emerald-400">
+                          {t.speakerLabel} ·{" "}
+                          {sourceLangObj ? sourceLangObj.nativeName : t.autoDetect}
+                        </span>
+                        {liveInputText && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              liveInputAccRef.current = "";
+                              setLiveInputText("");
+                            }}
+                            className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-bold text-slate-200 hover:border-red-400 hover:text-red-300"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            <span>{t.deleteItem}</span>
+                          </button>
+                        )}
+                      </div>
+                      <p
+                        className={
+                          liveInputText
+                            ? "text-2xl sm:text-3xl font-extrabold leading-snug text-white break-words"
+                            : "text-lg font-bold leading-relaxed text-slate-300"
+                        }
+                      >
+                        {liveInputText || t.speakerPlaceholder}
+                      </p>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-extrabold uppercase tracking-wider text-sky-400">
+                          {t.listenerLabel} · {targetLangObj.nativeName}
+                        </span>
+                        {liveOutputText && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              liveOutputAccRef.current = "";
+                              setLiveOutputText("");
+                              setLastTurnAudio(null);
+                            }}
+                            className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-bold text-slate-200 hover:border-red-400 hover:text-red-300"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            <span>{t.deleteItem}</span>
+                          </button>
+                        )}
+                      </div>
+                      <p
+                        className={
+                          liveOutputText
+                            ? "text-2xl sm:text-4xl font-extrabold leading-snug text-amber-300 break-words"
+                            : "text-lg font-bold leading-relaxed text-slate-300"
+                        }
+                      >
+                        {liveOutputText || t.listenerPlaceholder}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Dual-Channel Studio Grid (Speaker <-> Listener) */}
               <div className="grid grid-cols-1 items-stretch gap-4 lg:grid-cols-[1fr_auto_1fr]">
                 {/* Speaker Panel */}
@@ -1238,11 +1356,11 @@ export default function App() {
 
                     <div className="min-h-[150px] py-2">
                       {liveInputText ? (
-                        <p className="text-xl sm:text-2xl font-bold leading-relaxed text-slate-950">
+                        <p className="text-2xl sm:text-3xl font-extrabold leading-snug text-slate-950 break-words">
                           {liveInputText}
                         </p>
                       ) : (
-                        <p className="text-base font-semibold leading-relaxed text-slate-600">
+                        <p className="text-lg font-semibold leading-relaxed text-slate-700">
                           {t.speakerPlaceholder}
                         </p>
                       )}
@@ -1372,13 +1490,13 @@ export default function App() {
                       />
                     </div>
 
-                    <div className="min-h-[150px] py-2">
+                    <div className="min-h-[150px] rounded-lg bg-blue-50/40 p-3">
                       {liveOutputText ? (
-                        <p className="text-xl sm:text-2xl font-bold leading-relaxed text-slate-950">
+                        <p className="text-2xl sm:text-3xl font-extrabold leading-snug text-slate-950 break-words">
                           {liveOutputText}
                         </p>
                       ) : (
-                        <p className="text-base font-semibold leading-relaxed text-slate-600">
+                        <p className="text-lg font-semibold leading-relaxed text-slate-700">
                           {t.listenerPlaceholder}
                         </p>
                       )}

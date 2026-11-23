@@ -287,8 +287,8 @@ export function RemoteRoomView({
         const pcm16k = downsampleTo16k(raw, pipeline.ctx.sampleRate);
         const blockedByEcho =
           echoGuardRef.current &&
-          (Boolean(playerRef.current?.isSpeaking(700)) ||
-            Date.now() - lastIncomingAudioAtRef.current < 700);
+          (Boolean(playerRef.current?.isSpeaking(350)) ||
+            Date.now() - lastIncomingAudioAtRef.current < 350);
         const { sendFrames, flushNow } = speechGate.processFrame(
           pcm16k,
           whisperBoostRef.current,
@@ -957,30 +957,40 @@ export function RemoteRoomView({
               </div>
             </div>
 
-            {liveCaption && (liveCaption.sourceText || liveCaption.translatedText) && (
-              <div className="rounded-lg border border-blue-300 bg-blue-50/70 px-4 py-3">
+            {(liveCallActive ||
+              (liveCaption && (liveCaption.sourceText || liveCaption.translatedText))) && (
+              <div className="rounded-xl border-2 border-slate-800 bg-slate-950 px-5 py-4 text-white">
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-sm font-extrabold text-blue-900">
-                    {t.liveCaptionsTitle} · {liveCaption.speakerName}
+                  <div className="text-xs font-extrabold uppercase tracking-wider text-sky-400">
+                    {t.liveCaptionsTitle}
+                    {liveCaption?.speakerName ? ` · ${liveCaption.speakerName}` : ""}
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setLiveCaption(null)}
-                    title={t.deleteItem}
-                    aria-label={t.deleteItem}
-                    className="inline-flex h-7 items-center gap-1 rounded-md border border-blue-200 bg-white px-2 text-xs font-bold text-slate-700 hover:border-red-300 hover:bg-red-50 hover:text-red-700"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    <span>{t.deleteItem}</span>
-                  </button>
+                  {liveCaption && (
+                    <button
+                      type="button"
+                      onClick={() => setLiveCaption(null)}
+                      title={t.deleteItem}
+                      aria-label={t.deleteItem}
+                      className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-bold text-slate-200 hover:border-red-400 hover:text-red-300"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span>{t.deleteItem}</span>
+                    </button>
+                  )}
                 </div>
-                {liveCaption.translatedText && (
-                  <p className="mt-1 text-lg font-bold text-slate-950">
-                    {liveCaption.translatedText}
+                <p
+                  className={
+                    liveCaption?.translatedText
+                      ? "mt-2 text-2xl sm:text-3xl font-extrabold leading-snug text-amber-300 break-words"
+                      : "mt-2 text-lg font-semibold text-slate-400"
+                  }
+                >
+                  {liveCaption?.translatedText || t.listenerPlaceholder}
+                </p>
+                {liveCaption?.sourceText && (
+                  <p className="mt-2 text-lg sm:text-xl font-bold leading-snug text-white break-words">
+                    {liveCaption.sourceText}
                   </p>
-                )}
-                {liveCaption.sourceText && (
-                  <p className="mt-1 text-sm font-semibold text-slate-700">{liveCaption.sourceText}</p>
                 )}
               </div>
             )}
@@ -1032,11 +1042,11 @@ export function RemoteRoomView({
                         </button>
                       </div>
                     </div>
-                    <p className="mt-1.5 text-lg font-bold leading-relaxed text-slate-950">
+                    <p className="mt-1.5 text-xl font-extrabold leading-relaxed text-slate-950">
                       {m.translatedText}
                     </p>
                     {m.sourceText && m.sourceText !== m.translatedText && (
-                      <p className="mt-1 text-sm font-semibold leading-relaxed text-slate-700">
+                      <p className="mt-1 text-base font-bold leading-relaxed text-slate-700">
                         {m.sourceText}
                       </p>
                     )}

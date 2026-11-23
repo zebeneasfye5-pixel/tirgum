@@ -121,13 +121,13 @@ export class AdaptiveSpeechGate {
     }
 
     const rms = computeFloat32Rms(pcm16k);
-    const minFloor = whisperBoost ? 0.0068 : 0.011;
-    const snrMult = whisperBoost ? 2.4 : 2.8;
+    const minFloor = whisperBoost ? 0.0038 : 0.0062;
+    const snrMult = whisperBoost ? 2.1 : 2.4;
     const threshold = Math.max(minFloor, this.noiseFloor * snrMult);
 
-    if (!this.active && rms < threshold) {
+    if (!this.active && this.confirmCount === 0 && rms < minFloor * 1.6) {
       const updated = this.noiseFloor * 0.96 + rms * 0.04;
-      this.noiseFloor = Math.max(0.003, Math.min(0.045, updated));
+      this.noiseFloor = Math.max(0.002, Math.min(0.035, updated));
     }
 
     const base64 = float32ToPcm16Base64(pcm16k);
@@ -141,7 +141,7 @@ export class AdaptiveSpeechGate {
         if (this.confirmCount >= 2) {
           this.active = true;
           this.confirmCount = 0;
-          this.hangoverFrames = 7;
+          this.hangoverFrames = 4;
           const frames = [...this.preRoll];
           this.preRoll = [];
           return { sendFrames: frames, flushNow: false };
@@ -149,7 +149,7 @@ export class AdaptiveSpeechGate {
         return { sendFrames: [], flushNow: false };
       }
 
-      this.hangoverFrames = 7;
+      this.hangoverFrames = 4;
       return { sendFrames: [base64], flushNow: false };
     }
 
@@ -320,12 +320,9 @@ export class GaplessPcmPlayer {
     return Math.max(0, (this.nextStartTime - this.ctx.currentTime) * 1000);
   }
 
-  public isSpeaking(cooldownMs = 700): boolean {
+  public isSpeaking(cooldownMs = 350): boolean {
     if (this.muted) return false;
     if (this.activeSources.size > 0 || this.getRemainingMs() > 20) {
-      return true;
-    }
-    if (typeof window !== "undefined" && window.speechSynthesis?.speaking) {
       return true;
     }
     return Date.now() - this.lastPlaybackEndAt < cooldownMs;
