@@ -137,13 +137,12 @@ function normalizePcm16Buffer(pcmBuffer: Buffer): Buffer {
     if (abs > peak) peak = abs;
   }
 
-  // Only normalize genuinely quiet/whispered captures (< 7,500 peak) with gentle max 4.5x gain
-  // so normal Amharic ejectives & consonants never clip or distort.
-  if (peak < 90 || peak >= 7500) {
+  // Never amplify silent room hiss/static (< 420 peak); cap gain at 3.2x so noise stays quiet
+  if (peak < 420 || peak >= 7500) {
     return pcmBuffer;
   }
 
-  const gain = Math.min(5.0, 18500 / peak);
+  const gain = Math.min(3.2, 16000 / peak);
   const out = Buffer.allocUnsafe(pcmBuffer.length);
   for (let i = 0; i < sampleCount; i++) {
     const boosted = Math.round(pcmBuffer.readInt16LE(i * 2) * gain);
@@ -151,6 +150,71 @@ function normalizePcm16Buffer(pcmBuffer: Buffer): Buffer {
     out.writeInt16LE(clamped, i * 2);
   }
   return out;
+}
+
+/**
+ * Acoustic gate before invoking Gemini on a queued utterance:
+ * rejects desk taps, fan hum, breathing, or faint static so Gemini only sees real speech.
+ */
+function hasValidSpeechEnergy(
+  chunks: Buffer[],
+  noiseFloor: number,
+  whisperBoost: boolean
+): boolean {
+  let totalBytes = 0;
+  let peakAbs = 0;
+  let maxChunkRms = 0;
+  let activeFrames = 0;
+  const minRms = Math.max(whisperBoost ? 0.0055 : 0.0095, noiseFloor * 2.2);
+  const minChunkPeak = whisperBoost ? 480 : 850;
+
+  for (const chunk of chunks) {
+    totalBytes += chunk.length;
+    const chunkRms = computePcm16Rms(chunk);
+    if (chunkRms > maxChunkRms) maxChunkRms = chunkRms;
+
+    let chunkPeak = 0;
+    const sampleCount = Math.floor(chunk.length / 2);
+    for (let i = 0; i < sampleCount; i++) {
+      const abs = Math.abs(chunk.readInt16LE(i * 2));
+      if (abs > chunkPeak) chunkPeak = abs;
+    }
+    if (chunkPeak > peakAbs) peakAbs = chunkPeak;
+    if (chunkRms >= minRms && chunkPeak >= minChunkPeak) {
+      activeFrames += 1;
+    }
+  }
+
+  if (totalBytes < 16000 * 2 * 0.25) return false;
+  if (peakAbs < minChunkPeak) return false;
+  if (maxChunkRms < minRms) return false;
+  if (activeFrames < 2) return false;
+  return true;
+}
+
+function isNoiseOrHallucination(sourceText: string, translatedText: string): boolean {
+  const src = sourceText.trim();
+  const tr = translatedText.trim();
+  if (!src && !tr) return true;
+
+  // Reject bracketed sound descriptions such as [inaudible], [noise], (music), *cough*
+  const stripBrackets = (s: string) =>
+    s
+      .replace(/\[[^\]]*\]/g, "")
+      .replace(/\([^)]*\)/g, "")
+      .replace(/\*[^*]*\*/g, "")
+      .replace(/[\s.,!?;:'"…\-–—።፣፤፥]+/g, "")
+      .trim();
+
+  const srcCore = stripBrackets(src);
+  const trCore = stripBrackets(tr);
+  if (srcCore.length < 2 || trCore.length < 1) return true;
+
+  const noiseTagPattern =
+    /^(none|inaudible|unintelligible|silence|no speech|noise|music|applause|breathing|static|background noise|cough|laughter)$/i;
+  if (noiseTagPattern.test(srcCore) || noiseTagPattern.test(trCore)) return true;
+
+  return false;
 }
 
 /**
@@ -233,9 +297,10 @@ ETHIOPIC / AMHARIC PRECISION RULES:
     : "";
 
   const promptText = params.audioBase64
-    ? `Listen closely to the audio—including soft, whispered, or distant speech. ${sourceHint}${ethiopicRules}
-1) Transcribe EVERY single spoken word accurately in its original language and native script. Do NOT invent words from background noise; if there is no clear speech, return empty strings for all fields.
-2) Translate the full meaning accurately, naturally, and completely into the destination language with zero omitted words.
+    ? `STRICT HEARING-ONLY RULE: Listen strictly to the actual audible speech in this audio clip. ${sourceHint}${ethiopicRules}
+1) Transcribe ONLY words that are genuinely and clearly spoken in the audio—even if quiet/low-tone. NEVER guess, hallucinate, complete unspoken sentences, or invent phantom greetings/phrases (like "Thank you", "Hello", "You", "ሰላም", "እሺ", or "[inaudible]") from background noise, breathing, room hiss, clicks, or silence.
+2) If there are NO clearly audible human spoken words, return empty strings ("") for ALL fields immediately.
+3) Translate ONLY what was actually spoken into the destination language cleanly and naturally.
 Return strict JSON.`
     : `${sourceHint}${ethiopicRules}
 Translate every word completely, accurately, and naturally with zero omissions.
@@ -258,6 +323,7 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
       model: modelName,
       contents: { parts },
       config: {
+        temperature: 0,
         thinkingConfig: { thinkingLevel },
         responseMimeType: "application/json",
         responseSchema: {
@@ -265,7 +331,7 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
           properties: {
             sourceTranscript: {
               type: Type.STRING,
-              description: "Exact word-for-word transcription in original script.",
+              description: "Exact word-for-word transcription in original script, or empty string if silent/noise.",
             },
             detectedLanguage: {
               type: Type.STRING,
@@ -281,7 +347,7 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
             },
             translatedText: {
               type: Type.STRING,
-              description: "Complete, crystal-clear translation preserving every word.",
+              description: "Complete translation of spoken words only, or empty string if silent/noise.",
             },
           },
           required: ["sourceTranscript", "detectedLanguage", "translatedText"],
@@ -312,10 +378,15 @@ Return strict JSON with sourceTranscript equal to the original text, detectedLan
 
   const raw = (response.text ?? "{}").trim();
   const parsed = JSON.parse(raw) as Partial<TranslatedTurnResult>;
+  const sourceTranscript = (parsed.sourceTranscript ?? "").trim();
+  const translatedText = (parsed.translatedText ?? "").trim();
+  if (params.audioBase64 && isNoiseOrHallucination(sourceTranscript, translatedText)) {
+    return { sourceTranscript: "", detectedLanguage: "", translatedText: "" };
+  }
   return {
-    sourceTranscript: (parsed.sourceTranscript ?? "").trim(),
+    sourceTranscript,
     detectedLanguage: (parsed.detectedLanguage ?? "").trim(),
-    translatedText: (parsed.translatedText ?? "").trim(),
+    translatedText,
     resolvedSourceLang: (parsed.resolvedSourceLang ?? "").trim() || undefined,
     resolvedTargetLang: (parsed.resolvedTargetLang ?? "").trim() || undefined,
   };
@@ -394,10 +465,11 @@ async function transcribeAndTranslateStream(params: {
     ? `\nETHIOPIC / AMHARIC ACCURACY: Transcribe and translate Amharic (አማርኛ) / Tigrinya (ትግርኛ) strictly in standard Ethiopic Fidel script (ፊደል). Distinguish ejective vs plain consonants (ተ/ጠ, ቸ/ጨ, ፐ/ጰ, ቀ/ከ, ሰ/ሸ/ጸ) and exact vowel orders accurately.`
     : "";
 
-  const promptText = `Listen very carefully to the audio—including low-tone, quiet, whispered, or distant speech. ${directionPrompt}${ethiopicRules}
-Transcribe EVERY single spoken word faithfully in its native script, and translate the full natural meaning with zero omissions.
-If there is NO human speech (only noise/silence), output exactly: NONE
-Otherwise, output ONLY in this exact 3-line format (no markdown, no extra text):
+  const promptText = `STRICT HEARING-ONLY RULE: Listen strictly to what is actually spoken in this audio clip. ${directionPrompt}${ethiopicRules}
+Transcribe ONLY clearly audible human spoken words in native script, and translate only what was heard.
+NEVER guess, hallucinate, or invent words, greetings ("Hello", "Thank you", "ሰላም", "እሺ"), sound tags ("[inaudible]", "[noise]"), or phrases from background noise, breathing, mic clicks, or silence.
+If you do NOT clearly hear real human speech, output ONLY: NONE
+Otherwise, output ONLY this exact 3-line format (no markdown, no extra text):
 LANG: <detected BCP-47 source code>|<target BCP-47 code>|<Language English Name>
 SRC: <exact word-for-word transcript>
 TR: <complete natural translation>`;
@@ -417,6 +489,7 @@ TR: <complete natural translation>`;
       model: "gemini-4-hydrogen",
       contents: { parts },
       config: {
+        temperature: 0,
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       },
     });
@@ -428,9 +501,16 @@ TR: <complete natural translation>`;
         fullText += chunk.text;
         if (params.onPartial) {
           const parsed = parseStreamingTaggedOutput(fullText);
+          const hasValidPartial =
+            parsed.sourceTranscript.trim().length >= 2 &&
+            !isNoiseOrHallucination(
+              parsed.sourceTranscript,
+              parsed.translatedText || parsed.sourceTranscript
+            );
           if (
-            parsed.sourceTranscript !== lastSrcSent ||
-            parsed.translatedText !== lastTrSent
+            hasValidPartial &&
+            (parsed.sourceTranscript !== lastSrcSent ||
+              parsed.translatedText !== lastTrSent)
           ) {
             lastSrcSent = parsed.sourceTranscript;
             lastTrSent = parsed.translatedText;
@@ -439,7 +519,11 @@ TR: <complete natural translation>`;
         }
       }
     }
-    return parseStreamingTaggedOutput(fullText);
+    const finalParsed = parseStreamingTaggedOutput(fullText);
+    if (isNoiseOrHallucination(finalParsed.sourceTranscript, finalParsed.translatedText)) {
+      return { sourceTranscript: "", detectedLanguage: "", translatedText: "" };
+    }
+    return finalParsed;
   } catch (err) {
     if (isRetryableQuotaOrLoadError(err)) {
       const fallback = await transcribeAndTranslate({
@@ -449,7 +533,7 @@ TR: <complete natural translation>`;
         targetLangCode: params.targetLangCode,
         bidirectional: params.bidirectional,
       });
-      if (params.onPartial && (fallback.sourceTranscript || fallback.translatedText)) {
+      if (params.onPartial && fallback.sourceTranscript && fallback.translatedText) {
         params.onPartial(fallback);
       }
       return fallback;
@@ -656,6 +740,7 @@ interface LiveTranslatorChannel {
   vadPreRoll: Buffer[];
   vadChunks: Buffer[];
   vadSpeechActive: boolean;
+  vadConfirmCount: number;
   vadSpeechStartAt: number;
   vadLastVoiceAt: number;
   vadNoiseFloor: number;
@@ -753,6 +838,9 @@ async function drainRoomChannelVadQueue(
       const utterance: Buffer[] = [];
       while (channel.vadQueue.length > 0) {
         utterance.push(...channel.vadQueue.shift()!);
+      }
+      if (!hasValidSpeechEnergy(utterance, channel.vadNoiseFloor, speaker.whisperBoost)) {
+        continue;
       }
       const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
       try {
@@ -935,25 +1023,32 @@ function feedRoomChannelVadFrame(
   if (pcmBuf.length < 4) return;
   const rms = computePcm16Rms(pcmBuf);
   const now = Date.now();
-  const minFloor = speaker.whisperBoost ? 0.0024 : 0.0040;
-  const multiplier = speaker.whisperBoost ? 1.85 : 2.15;
+  const minFloor = speaker.whisperBoost ? 0.0055 : 0.0095;
+  const multiplier = speaker.whisperBoost ? 2.3 : 2.6;
   const SPEECH_THRESHOLD = Math.max(minFloor, channel.vadNoiseFloor * multiplier);
   const SILENCE_HANG_MS = 450;
   const MAX_UTTERANCE_MS = 6500;
-  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.24; // 240ms catches crisp short words
+  const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms sustained voice
 
   if (!channel.vadSpeechActive) {
     if (rms < SPEECH_THRESHOLD) {
-      channel.vadNoiseFloor = channel.vadNoiseFloor * 0.92 + rms * 0.08;
-    }
-    channel.vadPreRoll.push(pcmBuf);
-    if (channel.vadPreRoll.length > 5) channel.vadPreRoll.shift();
-    if (rms >= SPEECH_THRESHOLD) {
-      channel.vadSpeechActive = true;
-      channel.vadSpeechStartAt = now;
-      channel.vadLastVoiceAt = now;
-      channel.vadChunks = [...channel.vadPreRoll, pcmBuf];
-      channel.vadPreRoll = [];
+      channel.vadConfirmCount = 0;
+      const updated = channel.vadNoiseFloor * 0.94 + rms * 0.06;
+      channel.vadNoiseFloor = Math.max(0.003, Math.min(0.045, updated));
+      channel.vadPreRoll.push(pcmBuf);
+      if (channel.vadPreRoll.length > 5) channel.vadPreRoll.shift();
+    } else {
+      channel.vadConfirmCount += 1;
+      channel.vadPreRoll.push(pcmBuf);
+      if (channel.vadPreRoll.length > 6) channel.vadPreRoll.shift();
+      if (channel.vadConfirmCount >= 2) {
+        channel.vadSpeechActive = true;
+        channel.vadConfirmCount = 0;
+        channel.vadSpeechStartAt = now;
+        channel.vadLastVoiceAt = now;
+        channel.vadChunks = [...channel.vadPreRoll];
+        channel.vadPreRoll = [];
+      }
     }
     return;
   }
@@ -970,7 +1065,11 @@ function feedRoomChannelVadFrame(
     const utterance = channel.vadChunks;
     channel.vadChunks = [];
     channel.vadSpeechActive = false;
-    if (totalBytes >= MIN_UTTERANCE_BYTES) {
+    channel.vadConfirmCount = 0;
+    if (
+      totalBytes >= MIN_UTTERANCE_BYTES &&
+      hasValidSpeechEnergy(utterance, channel.vadNoiseFloor, speaker.whisperBoost)
+    ) {
       channel.vadQueue.push(utterance);
       void drainRoomChannelVadQueue(room, speaker, channel);
     }
@@ -1289,9 +1388,10 @@ function reconcileParticipantTranslators(room: RoomState, speaker: RoomParticipa
         vadPreRoll: [],
         vadChunks: [],
         vadSpeechActive: false,
+        vadConfirmCount: 0,
         vadSpeechStartAt: 0,
         vadLastVoiceAt: 0,
-        vadNoiseFloor: 0.0025,
+        vadNoiseFloor: 0.005,
         vadQueue: [],
         vadDraining: false,
       };
@@ -1775,9 +1875,10 @@ ${batchText}
     let vadPreRoll: Buffer[] = [];
     let vadChunks: Buffer[] = [];
     let vadSpeechActive = false;
+    let vadConfirmCount = 0;
     let vadSpeechStartAt = 0;
     let vadLastVoiceAt = 0;
-    let vadNoiseFloor = 0.0022;
+    let vadNoiseFloor = 0.005;
     const vadQueue: Buffer[][] = [];
     let vadDraining = false;
 
@@ -1805,7 +1906,11 @@ ${batchText}
           while (vadQueue.length > 0) {
             utterance.push(...vadQueue.shift()!);
           }
+          if (!hasValidSpeechEnergy(utterance, vadNoiseFloor, whisperBoost)) {
+            continue;
+          }
           const wavBase64 = pcm16ChunksToWavBase64(utterance, 16000);
+          let emittedPartial = false;
           try {
             const result = await transcribeAndTranslateStream({
               audioBase64: wavBase64,
@@ -1816,6 +1921,7 @@ ${batchText}
               onPartial: (partial) => {
                 if (isClosed || clientWs.readyState !== WebSocket.OPEN) return;
                 if (partial.sourceTranscript) {
+                  emittedPartial = true;
                   clientWs.send(
                     JSON.stringify({
                       type: "inputTranscript",
@@ -1825,6 +1931,7 @@ ${batchText}
                   );
                 }
                 if (partial.translatedText) {
+                  emittedPartial = true;
                   clientWs.send(
                     JSON.stringify({
                       type: "outputTranscript",
@@ -1836,7 +1943,12 @@ ${batchText}
               },
             });
             if (isClosed || clientWs.readyState !== WebSocket.OPEN) break;
-            if (!result.sourceTranscript && !result.translatedText) continue;
+            if (!result.sourceTranscript && !result.translatedText) {
+              if (emittedPartial) {
+                clientWs.send(JSON.stringify({ type: "turnDiscarded" }));
+              }
+              continue;
+            }
 
             if (result.sourceTranscript) {
               clientWs.send(
@@ -1941,25 +2053,32 @@ ${batchText}
       if (pcmBuf.length < 4) return;
       const rms = computePcm16Rms(pcmBuf);
       const now = Date.now();
-      const minFloor = whisperBoost ? 0.0024 : 0.0040;
-      const multiplier = whisperBoost ? 1.85 : 2.15;
+      const minFloor = whisperBoost ? 0.0055 : 0.0095;
+      const multiplier = whisperBoost ? 2.3 : 2.6;
       const SPEECH_THRESHOLD = Math.max(minFloor, vadNoiseFloor * multiplier);
       const SILENCE_HANG_MS = 450;
       const MAX_UTTERANCE_MS = 6500;
-      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.24; // 240ms preserves crisp short words
+      const MIN_UTTERANCE_BYTES = 16000 * 2 * 0.25; // 250ms sustained voice
 
       if (!vadSpeechActive) {
         if (rms < SPEECH_THRESHOLD) {
-          vadNoiseFloor = vadNoiseFloor * 0.92 + rms * 0.08;
-        }
-        vadPreRoll.push(pcmBuf);
-        if (vadPreRoll.length > 5) vadPreRoll.shift();
-        if (rms >= SPEECH_THRESHOLD) {
-          vadSpeechActive = true;
-          vadSpeechStartAt = now;
-          vadLastVoiceAt = now;
-          vadChunks = [...vadPreRoll, pcmBuf];
-          vadPreRoll = [];
+          vadConfirmCount = 0;
+          const updated = vadNoiseFloor * 0.94 + rms * 0.06;
+          vadNoiseFloor = Math.max(0.003, Math.min(0.045, updated));
+          vadPreRoll.push(pcmBuf);
+          if (vadPreRoll.length > 5) vadPreRoll.shift();
+        } else {
+          vadConfirmCount += 1;
+          vadPreRoll.push(pcmBuf);
+          if (vadPreRoll.length > 6) vadPreRoll.shift();
+          if (vadConfirmCount >= 2) {
+            vadSpeechActive = true;
+            vadConfirmCount = 0;
+            vadSpeechStartAt = now;
+            vadLastVoiceAt = now;
+            vadChunks = [...vadPreRoll];
+            vadPreRoll = [];
+          }
         }
         return;
       }
@@ -1976,7 +2095,11 @@ ${batchText}
         const utterance = vadChunks;
         vadChunks = [];
         vadSpeechActive = false;
-        if (totalBytes >= MIN_UTTERANCE_BYTES) {
+        vadConfirmCount = 0;
+        if (
+          totalBytes >= MIN_UTTERANCE_BYTES &&
+          hasValidSpeechEnergy(utterance, vadNoiseFloor, whisperBoost)
+        ) {
           vadQueue.push(utterance);
           void drainVadQueue();
         }
@@ -1989,7 +2112,11 @@ ${batchText}
       const utterance = vadChunks;
       vadChunks = [];
       vadSpeechActive = false;
-      if (totalBytes >= 16000 * 2 * 0.24) {
+      vadConfirmCount = 0;
+      if (
+        totalBytes >= 16000 * 2 * 0.25 &&
+        hasValidSpeechEnergy(utterance, vadNoiseFloor, whisperBoost)
+      ) {
         vadQueue.push(utterance);
         void drainVadQueue();
       }
@@ -2007,6 +2134,9 @@ ${batchText}
       sendConnectedStatus("precision-stream");
     };
 
+    // Pure digital silence buffer (64ms @ 16kHz) used to signal clean end-of-speech to Gemini Live
+    const DIGITAL_SILENCE_B64 = Buffer.alloc(2048).toString("base64");
+
     // Register client message & close listeners immediately to prevent missing early frames
     clientWs.on("message", (raw) => {
       if (isClosed) return;
@@ -2020,8 +2150,17 @@ ${batchText}
               audio: { data: parsed.data, mimeType: "audio/pcm;rate=16000" },
             });
           }
-        } else if (parsed.type === "vad_flush" && mode === "vad_stream") {
-          flushVad();
+        } else if (parsed.type === "vad_flush") {
+          if (mode === "vad_stream") {
+            flushVad();
+          } else if (activeSession) {
+            // Feed clean digital zeros (~512ms) so Live VAD finishes turn without ambient noise
+            for (let i = 0; i < 8; i++) {
+              activeSession.sendRealtimeInput({
+                audio: { data: DIGITAL_SILENCE_B64, mimeType: "audio/pcm;rate=16000" },
+              });
+            }
+          }
         }
       } catch {
         // Ignore malformed frames
@@ -2049,8 +2188,8 @@ ${batchText}
 
       const systemInstruction =
         isBidirectional && sourceLang
-          ? `You are an ultra-fast, high-precision two-way simultaneous voice interpreter between ${sourceLang.name} (${sourceLang.nativeName}) and ${targetLang.name} (${targetLang.nativeName}). Listen carefully even to soft, whispered, or distant speech: if it is ${sourceLang.name}, immediately speak ONLY the complete, word-for-word accurate translation in ${targetLang.name}; if it is ${targetLang.name}, immediately speak ONLY the complete translation in ${sourceLang.name}. Pronounce every word clearly with zero omissions or commentary.`
-          : `You are an ultra-fast, high-precision simultaneous voice interpreter. Listen carefully even to soft, whispered, or distant speech (${sourceLangLabel}) and immediately speak ONLY the complete, word-for-word accurate translation in ${targetLang.name} (${targetLang.nativeName}), pronouncing every word clearly with zero omissions or commentary.`;
+          ? `STRICT HEARING-ONLY INTERPRETER: Listen strictly to ${sourceLang.name} (${sourceLang.nativeName}) and ${targetLang.name} (${targetLang.nativeName}). Translate ONLY clearly audible spoken words; NEVER invent or hallucinate words during silence, breathing, clicks, or background noise.`
+          : `STRICT HEARING-ONLY INTERPRETER: Listen strictly to ${sourceLangLabel} and translate ONLY clearly audible spoken words into ${targetLang.name} (${targetLang.nativeName}). NEVER invent, guess, or speak anything during silence, breathing, clicks, or noise.`;
 
       const baseConfig = useTranslateModel
         ? {
@@ -2388,14 +2527,29 @@ ${batchText}
         if (msg.type === "room:live_flush") {
           const current = room!.participants.get(participantId);
           if (current && current.liveCallActive) {
+            const digitalZeroB64 = Buffer.alloc(2048).toString("base64");
             for (const ch of current.liveTranslators.values()) {
-              if (ch.closed || ch.mode !== "vad_stream") continue;
+              if (ch.closed) continue;
+              if (ch.mode !== "vad_stream") {
+                if (ch.session) {
+                  for (let i = 0; i < 8; i++) {
+                    ch.session.sendRealtimeInput({
+                      audio: { data: digitalZeroB64, mimeType: "audio/pcm;rate=16000" },
+                    });
+                  }
+                }
+                continue;
+              }
+              ch.vadConfirmCount = 0;
               if (ch.vadSpeechActive && ch.vadChunks.length > 0) {
                 const totalBytes = ch.vadChunks.reduce((acc, b) => acc + b.length, 0);
                 const utterance = ch.vadChunks;
                 ch.vadChunks = [];
                 ch.vadSpeechActive = false;
-                if (totalBytes >= 16000 * 2 * 0.24) {
+                if (
+                  totalBytes >= 16000 * 2 * 0.25 &&
+                  hasValidSpeechEnergy(utterance, ch.vadNoiseFloor, current.whisperBoost)
+                ) {
                   ch.vadQueue.push(utterance);
                   void drainRoomChannelVadQueue(room!, current, ch);
                 }

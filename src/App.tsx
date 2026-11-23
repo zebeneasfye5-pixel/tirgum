@@ -11,6 +11,7 @@ import {
   MicOff,
   Search,
   Send,
+  ShieldCheck,
   Square,
   Trash2,
   Volume2,
@@ -26,13 +27,13 @@ import {
   WORLD_LANGUAGES,
 } from "./data/languages";
 import {
+  AdaptiveSpeechGate,
   blobToBase64,
   BoostedMicPipeline,
   computeFloat32Rms,
   createBoostedMicPipeline,
   detectSlowNetwork,
   downsampleTo16k,
-  float32ToPcm16Base64,
   GaplessPcmPlayer,
   playWavBase64,
   speakBrowserFallback,
@@ -92,6 +93,7 @@ export default function App() {
     return (localStorage.getItem("lissan_voice") as VoiceId) || "Zephyr";
   });
   const [autoPlay, setAutoPlay] = useState<boolean>(true);
+  const [echoGuard, setEchoGuard] = useState<boolean>(true);
   const [whisperBoost, setWhisperBoost] = useState<boolean>(() => {
     return localStorage.getItem("lissan_whisper_boost") !== "false";
   });
@@ -146,6 +148,7 @@ export default function App() {
   const liveInputAccRef = useRef<string>("");
   const liveOutputAccRef = useRef<string>("");
   const autoPlayRef = useRef<boolean>(autoPlay);
+  const echoGuardRef = useRef<boolean>(echoGuard);
   const whisperBoostRef = useRef<boolean>(whisperBoost);
   const sourceLangRef = useRef<string>(sourceLang);
   const targetLangRef = useRef<string>(targetLang);
@@ -158,6 +161,8 @@ export default function App() {
   const turnStreamRef = useRef<MediaStream | null>(null);
   const turnCtxRef = useRef<AudioContext | null>(null);
   const turnChunksRef = useRef<Blob[]>([]);
+  const turnMaxRmsRef = useRef<number>(0);
+  const turnRmsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const t = UI_COPY[uiLang];
 
@@ -201,6 +206,10 @@ export default function App() {
     autoPlayRef.current = autoPlay;
     playerRef.current?.setMuted(!autoPlay);
   }, [autoPlay]);
+
+  useEffect(() => {
+    echoGuardRef.current = echoGuard;
+  }, [echoGuard]);
 
   useEffect(() => {
     whisperBoostRef.current = whisperBoost;
@@ -275,6 +284,10 @@ export default function App() {
   useEffect(() => {
     return () => {
       stopLiveSession();
+      if (turnRmsTimerRef.current) {
+        clearInterval(turnRmsTimerRef.current);
+        turnRmsTimerRef.current = null;
+      }
       if (turnPlayerRef.current) {
         turnPlayerRef.current.close();
         turnPlayerRef.current = null;
@@ -308,9 +321,7 @@ export default function App() {
       liveWsRef.current = ws;
 
       ws.onopen = () => {
-        const preRollQueue: string[] = [];
-        let speechGateActive = false;
-        let hangoverFrames = 0;
+        const speechGate = new AdaptiveSpeechGate();
 
         pipeline.processor.onaudioprocess = (e) => {
           if (ws.readyState !== WebSocket.OPEN || userStoppedLiveRef.current) return;
@@ -319,29 +330,19 @@ export default function App() {
           }
           const rawChannel = e.inputBuffer.getChannelData(0);
           const pcm16k = downsampleTo16k(rawChannel, pipeline.ctx.sampleRate);
-          const rms = computeFloat32Rms(pcm16k);
-          const base64 = float32ToPcm16Base64(pcm16k);
-          const gateThreshold = whisperBoostRef.current ? 0.0022 : 0.0038;
+          const blockedByEcho =
+            echoGuardRef.current && Boolean(playerRef.current?.isSpeaking(700));
+          const { sendFrames, flushNow } = speechGate.processFrame(
+            pcm16k,
+            whisperBoostRef.current,
+            blockedByEcho
+          );
 
-          if (rms >= gateThreshold) {
-            if (!speechGateActive) {
-              speechGateActive = true;
-              while (preRollQueue.length > 0) {
-                ws.send(JSON.stringify({ type: "audio", data: preRollQueue.shift()! }));
-              }
-            }
-            hangoverFrames = 7; // ~450ms trailing hangover
-            ws.send(JSON.stringify({ type: "audio", data: base64 }));
-          } else if (speechGateActive) {
-            ws.send(JSON.stringify({ type: "audio", data: base64 }));
-            hangoverFrames -= 1;
-            if (hangoverFrames <= 0) {
-              speechGateActive = false;
-              ws.send(JSON.stringify({ type: "vad_flush" }));
-            }
-          } else {
-            preRollQueue.push(base64);
-            if (preRollQueue.length > 5) preRollQueue.shift();
+          for (const frame of sendFrames) {
+            ws.send(JSON.stringify({ type: "audio", data: frame }));
+          }
+          if (flushNow) {
+            ws.send(JSON.stringify({ type: "vad_flush" }));
           }
         };
       };
@@ -379,6 +380,11 @@ export default function App() {
             setNoticeBanner(t.highTrafficWait);
           } else if (msg.type === "interrupted") {
             playerRef.current?.interrupt();
+          } else if (msg.type === "turnDiscarded") {
+            liveInputAccRef.current = "";
+            liveOutputAccRef.current = "";
+            setLiveInputText("");
+            setLiveOutputText("");
           } else if (msg.type === "turnComplete") {
             const committedIn = liveInputAccRef.current.trim();
             const committedOut = liveOutputAccRef.current.trim();
@@ -642,18 +648,38 @@ export default function App() {
         : "audio/webm";
       const recorder = new MediaRecorder(stream, { mimeType });
       turnChunksRef.current = [];
+      turnMaxRmsRef.current = 0;
+
+      const rmsBuf = new Float32Array(anal.fftSize);
+      if (turnRmsTimerRef.current) {
+        clearInterval(turnRmsTimerRef.current);
+      }
+      turnRmsTimerRef.current = setInterval(() => {
+        anal.getFloatTimeDomainData(rmsBuf);
+        const level = computeFloat32Rms(rmsBuf);
+        if (level > turnMaxRmsRef.current) {
+          turnMaxRmsRef.current = level;
+        }
+      }, 50);
 
       recorder.ondataavailable = (ev) => {
         if (ev.data.size > 0) turnChunksRef.current.push(ev.data);
       };
 
       recorder.onstop = async () => {
+        if (turnRmsTimerRef.current) {
+          clearInterval(turnRmsTimerRef.current);
+          turnRmsTimerRef.current = null;
+        }
         const blob = new Blob(turnChunksRef.current, { type: mimeType });
         turnStreamRef.current?.getTracks().forEach((tr) => tr.stop());
         void turnCtxRef.current?.close();
         setInputAnalyser(null);
 
-        if (blob.size < 400) return;
+        const minTurnRms = whisperBoostRef.current ? 0.0065 : 0.01;
+        if (blob.size < 400 || turnMaxRmsRef.current < minTurnRms) {
+          return;
+        }
         const base64 = await blobToBase64(blob);
         await executeTurnTranslation({
           audioBase64: base64,
@@ -665,6 +691,10 @@ export default function App() {
       recorder.start();
       setTurnRecording(true);
     } catch {
+      if (turnRmsTimerRef.current) {
+        clearInterval(turnRmsTimerRef.current);
+        turnRmsTimerRef.current = null;
+      }
       setErrorBanner(t.errorMicDenied);
     }
   };
@@ -1055,6 +1085,20 @@ export default function App() {
                   >
                     <Ear className="h-4 w-4" />
                     <span>{t.whisperBoostLabel}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setEchoGuard((v) => !v)}
+                    aria-pressed={echoGuard}
+                    className={`inline-flex h-10 items-center gap-1.5 rounded-lg border px-3.5 text-sm font-bold transition-colors whitespace-nowrap shrink-0 ${
+                      echoGuard
+                        ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+                        : "border-slate-300 bg-white text-slate-800 hover:bg-slate-50"
+                    }`}
+                  >
+                    <ShieldCheck className="h-4 w-4" />
+                    <span>{echoGuard ? t.echoGuardLabel : t.fullDuplexLabel}</span>
                   </button>
 
                   <button

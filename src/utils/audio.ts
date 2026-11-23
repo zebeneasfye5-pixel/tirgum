@@ -87,6 +87,89 @@ export function detectSlowNetwork(): boolean {
   return false;
 }
 
+/**
+ * Adaptive client-side Speech Gate (VAD + DTX):
+ * - Learns ambient room noise floor continuously during idle frames
+ * - Requires 2 consecutive sustained voice frames (~128ms) before opening
+ *   so desk taps, mic bumps, and random hiss never trigger ghost turns
+ * - Buffers 4 pre-roll frames (~256ms) so the first consonant is never clipped
+ * - Immediately resets during speaker playback (Echo Guard)
+ */
+export class AdaptiveSpeechGate {
+  private noiseFloor = 0.0055;
+  private preRoll: string[] = [];
+  private active = false;
+  private confirmCount = 0;
+  private hangoverFrames = 0;
+
+  public reset() {
+    this.preRoll = [];
+    this.active = false;
+    this.confirmCount = 0;
+    this.hangoverFrames = 0;
+  }
+
+  public processFrame(
+    pcm16k: Float32Array,
+    whisperBoost: boolean,
+    blockedByEchoGuard: boolean
+  ): { sendFrames: string[]; flushNow: boolean } {
+    if (blockedByEchoGuard) {
+      const wasActive = this.active;
+      this.reset();
+      return { sendFrames: [], flushNow: wasActive };
+    }
+
+    const rms = computeFloat32Rms(pcm16k);
+    const minFloor = whisperBoost ? 0.0068 : 0.011;
+    const snrMult = whisperBoost ? 2.4 : 2.8;
+    const threshold = Math.max(minFloor, this.noiseFloor * snrMult);
+
+    if (!this.active && rms < threshold) {
+      const updated = this.noiseFloor * 0.96 + rms * 0.04;
+      this.noiseFloor = Math.max(0.003, Math.min(0.045, updated));
+    }
+
+    const base64 = float32ToPcm16Base64(pcm16k);
+
+    if (rms >= threshold) {
+      if (!this.active) {
+        this.confirmCount += 1;
+        this.preRoll.push(base64);
+        if (this.preRoll.length > 5) this.preRoll.shift();
+
+        if (this.confirmCount >= 2) {
+          this.active = true;
+          this.confirmCount = 0;
+          this.hangoverFrames = 7;
+          const frames = [...this.preRoll];
+          this.preRoll = [];
+          return { sendFrames: frames, flushNow: false };
+        }
+        return { sendFrames: [], flushNow: false };
+      }
+
+      this.hangoverFrames = 7;
+      return { sendFrames: [base64], flushNow: false };
+    }
+
+    // rms < threshold
+    this.confirmCount = 0;
+    if (this.active) {
+      this.hangoverFrames -= 1;
+      if (this.hangoverFrames <= 0) {
+        this.active = false;
+        return { sendFrames: [base64], flushNow: true };
+      }
+      return { sendFrames: [base64], flushNow: false };
+    }
+
+    this.preRoll.push(base64);
+    if (this.preRoll.length > 4) this.preRoll.shift();
+    return { sendFrames: [], flushNow: false };
+  }
+}
+
 export async function createInputAudioContext(): Promise<AudioContext> {
   let ctx: AudioContext;
   try {
@@ -199,6 +282,7 @@ export class GaplessPcmPlayer {
   private nextStartTime = 0;
   private activeSources = new Set<AudioBufferSourceNode>();
   private muted = false;
+  private lastPlaybackEndAt = 0;
 
   public ensureContext(): { ctx: AudioContext; analyser: AnalyserNode } {
     if (!this.ctx) {
@@ -234,6 +318,17 @@ export class GaplessPcmPlayer {
   public getRemainingMs(): number {
     if (!this.ctx) return 0;
     return Math.max(0, (this.nextStartTime - this.ctx.currentTime) * 1000);
+  }
+
+  public isSpeaking(cooldownMs = 700): boolean {
+    if (this.muted) return false;
+    if (this.activeSources.size > 0 || this.getRemainingMs() > 20) {
+      return true;
+    }
+    if (typeof window !== "undefined" && window.speechSynthesis?.speaking) {
+      return true;
+    }
+    return Date.now() - this.lastPlaybackEndAt < cooldownMs;
   }
 
   public waitUntilDrained(abortSignal?: AbortSignal): Promise<void> {
@@ -278,11 +373,21 @@ export class GaplessPcmPlayer {
     }
 
     source.start(this.nextStartTime);
-    this.nextStartTime += buffer.duration / Math.max(0.5, playbackRate);
+    const playDur = buffer.duration / Math.max(0.5, playbackRate);
+    this.nextStartTime += playDur;
+    if (!this.muted) {
+      this.lastPlaybackEndAt = Math.max(
+        this.lastPlaybackEndAt,
+        Date.now() + (this.nextStartTime - now) * 1000
+      );
+    }
 
     this.activeSources.add(source);
     source.onended = () => {
       this.activeSources.delete(source);
+      if (!this.muted) {
+        this.lastPlaybackEndAt = Math.max(this.lastPlaybackEndAt, Date.now());
+      }
     };
   }
 
@@ -309,11 +414,21 @@ export class GaplessPcmPlayer {
     }
 
     source.start(this.nextStartTime);
-    this.nextStartTime += buffer.duration / Math.max(0.5, playbackRate);
+    const playDur = buffer.duration / Math.max(0.5, playbackRate);
+    this.nextStartTime += playDur;
+    if (!this.muted) {
+      this.lastPlaybackEndAt = Math.max(
+        this.lastPlaybackEndAt,
+        Date.now() + (this.nextStartTime - now) * 1000
+      );
+    }
 
     this.activeSources.add(source);
     source.onended = () => {
       this.activeSources.delete(source);
+      if (!this.muted) {
+        this.lastPlaybackEndAt = Math.max(this.lastPlaybackEndAt, Date.now());
+      }
     };
   }
 
@@ -343,10 +458,19 @@ export class GaplessPcmPlayer {
 
       source.start(this.nextStartTime);
       this.nextStartTime += decoded.duration;
+      if (!this.muted) {
+        this.lastPlaybackEndAt = Math.max(
+          this.lastPlaybackEndAt,
+          Date.now() + (this.nextStartTime - now) * 1000
+        );
+      }
 
       this.activeSources.add(source);
       source.onended = () => {
         this.activeSources.delete(source);
+        if (!this.muted) {
+          this.lastPlaybackEndAt = Math.max(this.lastPlaybackEndAt, Date.now());
+        }
       };
     } catch {
       if (!this.muted) {

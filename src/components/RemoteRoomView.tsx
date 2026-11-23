@@ -21,12 +21,11 @@ import {
 import { UI_COPY, UiLang } from "../data/i18n";
 import { getLanguageByCode, VOICE_PROFILES, VoiceId } from "../data/languages";
 import {
+  AdaptiveSpeechGate,
   BoostedMicPipeline,
-  computeFloat32Rms,
   createBoostedMicPipeline,
   detectSlowNetwork,
   downsampleTo16k,
-  float32ToPcm16Base64,
   GaplessPcmPlayer,
   playWavBase64,
   speakBrowserFallback,
@@ -273,48 +272,34 @@ export function RemoteRoomView({
       setLiveCallActive(true);
       setMicMuted(false);
 
-      const preRollQueue: string[] = [];
-      let speechGateActive = false;
-      let hangoverFrames = 0;
+      const speechGate = new AdaptiveSpeechGate();
 
       pipeline.processor.onaudioprocess = (e) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
         if (pipeline.ctx.state === "suspended") {
           void pipeline.ctx.resume();
         }
-        if (micMutedRef.current) return;
-        if (
-          echoGuardRef.current &&
-          Date.now() - lastIncomingAudioAtRef.current < 550
-        ) {
+        if (micMutedRef.current) {
+          speechGate.reset();
           return;
         }
         const raw = e.inputBuffer.getChannelData(0);
         const pcm16k = downsampleTo16k(raw, pipeline.ctx.sampleRate);
-        const rms = computeFloat32Rms(pcm16k);
-        const base64 = float32ToPcm16Base64(pcm16k);
-        const gateThreshold = whisperBoostRef.current ? 0.0022 : 0.0038;
+        const blockedByEcho =
+          echoGuardRef.current &&
+          (Boolean(playerRef.current?.isSpeaking(700)) ||
+            Date.now() - lastIncomingAudioAtRef.current < 700);
+        const { sendFrames, flushNow } = speechGate.processFrame(
+          pcm16k,
+          whisperBoostRef.current,
+          blockedByEcho
+        );
 
-        if (rms >= gateThreshold) {
-          if (!speechGateActive) {
-            speechGateActive = true;
-            while (preRollQueue.length > 0) {
-              const pre = preRollQueue.shift()!;
-              wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: pre }));
-            }
-          }
-          hangoverFrames = 7; // ~450ms trailing hangover
-          wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: base64 }));
-        } else if (speechGateActive) {
-          wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: base64 }));
-          hangoverFrames -= 1;
-          if (hangoverFrames <= 0) {
-            speechGateActive = false;
-            wsRef.current.send(JSON.stringify({ type: "room:live_flush" }));
-          }
-        } else {
-          preRollQueue.push(base64);
-          if (preRollQueue.length > 5) preRollQueue.shift();
+        for (const frame of sendFrames) {
+          wsRef.current.send(JSON.stringify({ type: "room:live_audio", data: frame }));
+        }
+        if (flushNow) {
+          wsRef.current.send(JSON.stringify({ type: "room:live_flush" }));
         }
       };
     } catch {
